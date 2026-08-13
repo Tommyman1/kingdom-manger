@@ -1,0 +1,67 @@
+services:
+  socket-proxy:
+    image: ghcr.io/tecnativa/docker-socket-proxy:v0.4.1
+    container_name: kingdom-socket-proxy
+    restart: unless-stopped
+    environment:
+      CONTAINERS: "1"
+      INFO: "1"
+      IMAGES: "1"
+      NETWORKS: "1"
+      VERSION: "1"
+      EVENTS: "1"
+      POST: "0"
+      AUTH: "0"
+      SECRETS: "0"
+      SERVICES: "0"
+      SWARM: "0"
+      SYSTEM: "0"
+      VOLUMES: "0"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - kingdom-internal
+    read_only: true
+    tmpfs:
+      - /run
+      - /tmp
+
+  kingdom-manager:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: kingdom-manager:0.1.0
+    container_name: kingdom-manager
+    restart: unless-stopped
+    depends_on:
+      - socket-proxy
+    environment:
+      TZ: America/New_York
+      DOCKER_HOST: tcp://socket-proxy:2375
+      DATABASE_PATH: /data/kingdom.db
+      ENABLE_MUTATIONS: "false"
+      IDLE_DEFAULT_SECONDS: "900"
+    volumes:
+      - kingdom-manager-data:/data
+    expose:
+      - "8000"
+    networks:
+      - kingdom-internal
+      - proxy
+    labels:
+      homepage.group: Infrastructure
+      homepage.name: Kingdom Manager
+      homepage.description: Container lifecycle, security, and automation manager
+      homepage.icon: mdi-crown
+      homepage.href: https://kingdom-manager-tail.kingdom.local
+
+networks:
+  kingdom-internal:
+    name: kingdom-internal
+    internal: true
+  proxy:
+    external: true
+
+volumes:
+  kingdom-manager-data:
+    name: kingdom-manager-data
