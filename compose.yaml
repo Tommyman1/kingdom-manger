@@ -30,7 +30,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: kingdom-manager:0.1.0
+    image: kingdom-manager:0.3.0
     container_name: kingdom-manager
     restart: unless-stopped
     depends_on:
@@ -41,6 +41,9 @@ services:
       DATABASE_PATH: /data/kingdom.db
       ENABLE_MUTATIONS: "false"
       IDLE_DEFAULT_SECONDS: "900"
+      JELLYFIN_URL: http://jellyfin:8096
+      JELLYFIN_API_KEY: ${JELLYFIN_API_KEY:-}
+      JELLYFIN_IDLE_SECONDS: "1800"
     volumes:
       - kingdom-manager-data:/data
     expose:

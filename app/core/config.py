@@ -11,6 +11,12 @@ class Settings(BaseSettings):
     scan_interval_seconds: int = 60
     idle_default_seconds: int = 900
     enable_mutations: bool = False
+    integration_secret_key: str = ''
+    integration_key_path: str = '/data/integration.key'
+
+    jellyfin_url: str = 'http://jellyfin:8096'
+    jellyfin_api_key: str = ''
+    jellyfin_idle_seconds: int = 1800
 
 
 settings = Settings()
