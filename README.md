@@ -1,121 +1,82 @@
-# 👑 Kingdom Manager v0.3
+# 👑 Kingdom Manager v1
 
-Kingdom Manager is a standalone, self-hosted Docker lifecycle, security, and automation platform for a trusted local homelab.
+Kingdom Manager is the control plane for the Kingdom Docker host. It does not replace Docker, ClamAV, CrowdSec, Falco, Wazuh, Trivy, or n8n; it coordinates them.
 
-> ⚠️ **Security notice:** Kingdom Manager is designed to run on a trusted local network, VPN, or Tailscale network. Do **not** expose it directly to the public Internet. v0.3 can store service API credentials for monitoring. Those credentials are encrypted at rest, masked in the UI, and should be limited to the minimum read permissions needed. A future Kingdom Manager with Docker mutation permissions will be a highly privileged service.
+## What is implemented
 
-## v0.3 scope
+- Container inventory and health/state dashboard
+- Start, stop, restart, pause/unpause API
+- Per-container safety policies
+- CPU/network idle sampling
+- Unexpected-stop auto-recovery (policy controlled)
+- Docker configuration snapshots before disruptive actions
+- Quarantine network isolation and network restoration
+- Security-event ingestion and decision recording
+- Falcosidekick webhook receiver
+- Trivy image scans through an isolated runner
+- Public-image update checks by pulling without recreating the container
+- ClamAV / CrowdSec / Wazuh connectivity status
+- Discord + n8n notification hooks
+- Persistent SQLite event, policy, scan, decision, and snapshot history
+- Automatic Monday weekly report notification
+- Token-protected management API/dashboard
 
-- Read-only Docker discovery through a restricted Docker socket proxy
-- Container classification and Compose stack recognition
-- Conservative safe-to-interrupt policy engine
-- Persistent idle/grace state
-- Integration framework with four permission modes: `OBSERVE`, `MONITOR`, `MANAGE`, `PROTECTED`
-- Built-in Jellyfin activity integration
-- Built-in n8n execution-state integration
-- Generic HTTP JSON activity integration for future services
-- Manual credential entry; no global secret harvesting
-- Credentials encrypted with Fernet and stored in SQLite
-- Automatic local encryption key at `/data/integration.key` when no key is supplied
-- Integration test UI at `/integrations`
-- Docker mutations remain disabled
+## Deliberate safety gates
 
-## Security model
+`auto_isolate` defaults OFF. `auto_update` defaults OFF. A pulled update is never automatically installed in v1. `protected` prevents automatic isolation and some disruptive actions. Container deletion/recreation is intentionally not enabled until a restore test has proven that container's snapshot can be recreated correctly.
 
-`kingdom-manager` never mounts `/var/run/docker.sock` directly. `kingdom-socket-proxy` is the only service with that mount and `POST=0` remains enabled, preventing Kingdom Manager from changing Docker through the proxy in this release.
+This is important: Docker's create-container API cannot safely replay every Compose/Portainer stack from raw inspect data. Kingdom Manager records the snapshot now, but automatic destructive rebuild should be stack-aware before it is enabled.
 
-For service APIs, use the least privilege possible. Kingdom Manager generally only needs enough access to answer questions such as "is anyone actively using this service?" or "is a job running?". Do not give it user-management, deletion, configuration-change, or administrative scopes unless a future feature explicitly requires them.
+## Install on Kingdom
 
-The default encryption key is generated inside the persistent `kingdom-manager-data` volume. Back up that volume/key with the database; losing the key means stored integration credentials cannot be decrypted. Never commit `/data/integration.key`, `.env`, API keys, tokens, or production credentials to GitHub.
-
-## Deploy in Portainer
-
-Use the repository as a Git-backed Portainer stack or build the image on the Docker host. The app uses internal port `8000`; do not publish it on the host. Nginx Proxy Manager can reach `kingdom-manager:8000` on the external `proxy` Docker network.
-
-Keep these settings in v0.3:
-
-```yaml
-POST: "0"
-ENABLE_MUTATIONS: "false"
+```bash
+mkdir -p /home/tommytheog/Docker/kingdom-manager
+cd /home/tommytheog/Docker/kingdom-manager
+# copy the contents of this package here
+cp .env.example .env
+TOKEN=$(openssl rand -hex 32)
+sed -i "s/CHANGE_ME_TO_A_LONG_RANDOM_TOKEN/$TOKEN/" .env
+printf '\nKingdom Manager token: %s\n' "$TOKEN"
+docker compose up -d --build
 ```
 
-After deployment, open:
+## Nginx Proxy Manager
 
-```text
-https://kingdom-manager-tail.kingdom.local/integrations
+- Domain: `kingdom-manager-tail.kingdom.local`
+- Scheme: `http`
+- Forward hostname: `kingdom-manager`
+- Forward port: `8080`
+- Websockets: on
+- Keep it internal/Tailscale only.
+
+## Connect existing ClamAV / CrowdSec / Wazuh
+
+Kingdom Manager must share a Docker network with a service before it can address that service by container name. Do **not** expose their API ports on the host just to make the integration work. Instead, attach Kingdom Manager to the required internal network or attach the service to `kingdom-manager-internal` when appropriate.
+
+Example:
+
+```bash
+docker network connect kingdom-manager-internal clamav
 ```
 
-## Add Jellyfin
+For CrowdSec/Wazuh, set their internal URL and API credential in `.env`.
 
-In **Integrations → Add integration**:
+## Falco
 
-```text
-Type: Jellyfin
-Name: Jellyfin
-Container: jellyfin
-URL: http://jellyfin:8096
-Permission: MONITOR
-API key: <a read-only/minimum-access Jellyfin API key>
-```
+Point Falcosidekick's webhook output to:
 
-Press **Test** after saving. When the test succeeds, the dashboard activity engine will use Jellyfin session information and the existing 30-minute Jellyfin idle grace period.
+`http://kingdom-manager:8080/api/security/falco`
 
-## Add n8n
+Keep Falcosidekick on a network that can reach Kingdom Manager; the endpoint is intended for internal Docker traffic.
 
-```text
-Type: n8n
-Name: n8n
-Container: n8n
-URL: http://n8n:5678
-Permission: MONITOR
-API key: <n8n API key with only the access needed to read executions>
-```
+## Trivy
 
-Kingdom Manager only performs GET requests in the current n8n adapter.
+The included Trivy runner scans image references from the registry and keeps its vulnerability DB cache in a Docker volume. Custom local-only images that do not exist in a registry cannot be scanned by this runner mode yet.
 
-## Add an unsupported service
+## API token
 
-Use **Generic HTTP** when a service exposes a JSON status endpoint.
+The dashboard asks for `KM_API_TOKEN` once and stores it in browser local storage. Do not share the token. For additional defense, keep NPM access restricted to your Tailscale/internal DNS path.
 
-Example response:
+## First policy recommendation
 
-```json
-{
-  "jobs": {
-    "running": 2
-  }
-}
-```
-
-Configure:
-
-```text
-URL: http://my-service:3000
-Status path: /api/status
-JSON field: jobs.running
-Busy comparison: >
-Value: 0
-```
-
-Kingdom Manager then treats `jobs.running > 0` as busy. An optional bearer token can be stored for authenticated GET endpoints.
-
-## API
-
-- `GET /health`
-- `GET /api/containers`
-- `GET /api/containers/{name}`
-- `GET /api/stacks`
-- `GET /api/integrations`
-- `POST /api/integrations/{id}/test`
-- `GET /api/security`
-- `GET /api/workflows`
-
-## Planned next steps
-
-1. Add built-in Immich, Paperless, Navidrome, Audiobookshelf, and other activity adapters.
-2. Add per-integration configurable idle grace periods.
-3. Add update detection while staying read-only.
-4. Add Trivy candidate-image scanning.
-5. Add trusted container baselines and drift detection.
-6. Add authenticated Kingdom Manager admin access before Docker mutation capability.
-7. Only then add carefully scoped update/recreate/rollback permissions.
+Keep `protected` ON for infrastructure such as Nginx Proxy Manager, Tailscale, Portainer, databases, Kingdom Manager itself, and other stateful services until each recovery path is tested. Enable `auto_isolate` only on containers where losing network access is preferable to continued operation during a critical alert.

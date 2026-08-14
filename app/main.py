@@ -1,272 +1,653 @@
-from contextlib import asynccontextmanager
-from html import escape
+from __future__ import annotations
 
-from fastapi import FastAPI, Form, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse
+import asyncio
+import json
+import os
+import sqlite3
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
-from app.core.config import settings
-from app.core.db import init_db
-from app.integrations.registry import list_integrations as integration_catalog
-from app.integrations.service import IntegrationService
-from app.security.adapters import SecurityAdapterRegistry
-from app.services.activity_service import ActivityService
-from app.services.classification_service import ClassificationService
-from app.services.docker_service import DockerService
-from app.services.policy_service import PolicyService
-from app.workflows.engine import WorkflowEngine
+import httpx
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import HTMLResponse
 
+VERSION = "1.0.0"
+app = FastAPI(title="Kingdom Manager", version=VERSION)
 
-docker_service = DockerService()
-integration_service = IntegrationService()
-activity_service = ActivityService()
-classification_service = ClassificationService()
-policy_service = PolicyService()
-security_registry = SecurityAdapterRegistry()
-workflow_engine = WorkflowEngine()
-VERSION = '0.3.0'
+DOCKER = os.getenv("DOCKER_HOST", "tcp://docker-socket-proxy:2375").replace("tcp://", "http://")
+DATA_DIR = Path(os.getenv("KM_DATA_DIR", "/data"))
+DB_PATH = DATA_DIR / "kingdom.db"
+API_TOKEN = os.getenv("KM_API_TOKEN", "")
+TZ = ZoneInfo(os.getenv("TZ", "America/New_York"))
+QUARANTINE_NETWORK = os.getenv("KM_QUARANTINE_NETWORK", "kingdom-quarantine")
+TRIVY_RUNNER = os.getenv("TRIVY_RUNNER", "kingdom-manager-trivy")
+CHECK_SECONDS = int(os.getenv("KM_CHECK_SECONDS", "300"))
+IDLE_CPU = float(os.getenv("KM_IDLE_CPU_PERCENT", "3.0"))
+IDLE_MINUTES = int(os.getenv("KM_IDLE_MINUTES", "20"))
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL", "")
+N8N_WEBHOOK = os.getenv("N8N_WEBHOOK_URL", "")
+CLAMAV_HOST = os.getenv("CLAMAV_HOST", "clamav")
+CLAMAV_PORT = int(os.getenv("CLAMAV_PORT", "3310"))
+CROWDSEC_URL = os.getenv("CROWDSEC_URL", "")
+CROWDSEC_API_KEY = os.getenv("CROWDSEC_API_KEY", "")
+WAZUH_URL = os.getenv("WAZUH_URL", "")
+WAZUH_TOKEN = os.getenv("WAZUH_TOKEN", "")
 
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    init_db()
-    yield
-
-
-app = FastAPI(title=settings.app_name, version=VERSION, lifespan=lifespan)
-
-
-@app.get('/health')
-def health():
-    docker_ok = docker_service.ping()
-    return {
-        'status': 'healthy' if docker_ok else 'degraded',
-        'docker': docker_ok,
-        'mutations_enabled': settings.enable_mutations,
-        'version': VERSION,
-    }
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def enrich(item: dict) -> dict:
-    classification = classification_service.classify(item)
-    activity = activity_service.classify(item, classification)
-    interruption = policy_service.interruption_decision(activity=activity, classification=classification)
-    return {**item, 'classification': classification, 'activity': activity, 'interruption': interruption}
+def conn() -> sqlite3.Connection:
+    c = sqlite3.connect(DB_PATH, timeout=30)
+    c.row_factory = sqlite3.Row
+    return c
 
 
-@app.get('/api/containers')
-def containers():
+def init_db() -> None:
+    with conn() as c:
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS events(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
+          kind TEXT NOT NULL, subject TEXT, detail TEXT, severity TEXT DEFAULT 'info'
+        );
+        CREATE TABLE IF NOT EXISTS policies(
+          container_name TEXT PRIMARY KEY,
+          auto_restart INTEGER NOT NULL DEFAULT 1,
+          auto_update INTEGER NOT NULL DEFAULT 0,
+          auto_isolate INTEGER NOT NULL DEFAULT 0,
+          allow_rebuild INTEGER NOT NULL DEFAULT 0,
+          protected INTEGER NOT NULL DEFAULT 0,
+          idle_cpu REAL NOT NULL DEFAULT 3.0,
+          idle_minutes INTEGER NOT NULL DEFAULT 20
+        );
+        CREATE TABLE IF NOT EXISTS runtime_samples(
+          container_name TEXT PRIMARY KEY, ts INTEGER NOT NULL,
+          cpu REAL NOT NULL DEFAULT 0, rx INTEGER NOT NULL DEFAULT 0, tx INTEGER NOT NULL DEFAULT 0,
+          idle_since INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS snapshots(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
+          container_name TEXT NOT NULL, reason TEXT NOT NULL, inspect_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS security_events(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
+          source TEXT NOT NULL, severity TEXT NOT NULL, container_name TEXT,
+          message TEXT NOT NULL, raw_json TEXT
+        );
+        CREATE TABLE IF NOT EXISTS decisions(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
+          container_name TEXT, decision TEXT NOT NULL, reason TEXT NOT NULL,
+          executed INTEGER NOT NULL DEFAULT 0, result TEXT
+        );
+        CREATE TABLE IF NOT EXISTS scans(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
+          container_name TEXT, image TEXT NOT NULL, status TEXT NOT NULL,
+          critical INTEGER DEFAULT 0, high INTEGER DEFAULT 0, medium INTEGER DEFAULT 0,
+          result_json TEXT
+        );
+        CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+        """)
+
+
+init_db()
+
+
+def now() -> int:
+    return int(time.time())
+
+
+def event(kind: str, subject: str = "", detail: Any = "", severity: str = "info") -> None:
+    if not isinstance(detail, str):
+        detail = json.dumps(detail, separators=(",", ":"), default=str)
+    with conn() as c:
+        c.execute("INSERT INTO events(ts,kind,subject,detail,severity) VALUES(?,?,?,?,?)",
+                  (now(), kind, subject, detail[:20000], severity))
+
+
+def rowdicts(rows):
+    return [dict(r) for r in rows]
+
+
+def require_token(authorization: str | None) -> None:
+    if not API_TOKEN:
+        raise HTTPException(503, "KM_API_TOKEN is not configured")
+    if authorization != f"Bearer {API_TOKEN}":
+        raise HTTPException(401, "Invalid Kingdom Manager token")
+
+
+async def docker(method: str, path: str, **kwargs) -> httpx.Response:
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.request(method, DOCKER + path, **kwargs)
+        return r
+
+
+async def docker_json(method: str, path: str, ok=(200,), **kwargs):
+    r = await docker(method, path, **kwargs)
+    if r.status_code not in ok:
+        raise HTTPException(r.status_code, r.text[:2000])
+    return r.json() if r.content else None
+
+
+async def inspect_container(name: str) -> dict:
+    return await docker_json("GET", f"/containers/{quote(name, safe='')}/json")
+
+
+async def list_containers(all_: bool = True) -> list[dict]:
+    data = await docker_json("GET", f"/containers/json?all={1 if all_ else 0}")
+    out = []
+    for c in data:
+        out.append({
+            "id": c.get("Id", "")[:12], "full_id": c.get("Id", ""),
+            "name": (c.get("Names") or [""])[0].lstrip("/"),
+            "image": c.get("Image", ""), "image_id": c.get("ImageID", ""),
+            "state": c.get("State", "unknown"), "status": c.get("Status", ""),
+            "labels": c.get("Labels") or {},
+        })
+    return out
+
+
+def default_policy(name: str) -> dict:
+    with conn() as c:
+        r = c.execute("SELECT * FROM policies WHERE container_name=?", (name,)).fetchone()
+        if not r:
+            c.execute("INSERT INTO policies(container_name,idle_cpu,idle_minutes) VALUES(?,?,?)",
+                      (name, IDLE_CPU, IDLE_MINUTES))
+            r = c.execute("SELECT * FROM policies WHERE container_name=?", (name,)).fetchone()
+    return dict(r)
+
+
+async def sample_stats(name: str) -> dict:
+    r = await docker("GET", f"/containers/{quote(name, safe='')}/stats?stream=false&one-shot=true")
+    if r.status_code != 200:
+        return {"cpu": 0.0, "rx": 0, "tx": 0}
+    s = r.json()
+    cpu_stats, pre = s.get("cpu_stats", {}), s.get("precpu_stats", {})
+    total = cpu_stats.get("cpu_usage", {}).get("total_usage", 0) - pre.get("cpu_usage", {}).get("total_usage", 0)
+    system = cpu_stats.get("system_cpu_usage", 0) - pre.get("system_cpu_usage", 0)
+    cpus = cpu_stats.get("online_cpus") or len(cpu_stats.get("cpu_usage", {}).get("percpu_usage") or []) or 1
+    cpu = (total / system * cpus * 100.0) if total > 0 and system > 0 else 0.0
+    rx = tx = 0
+    for n in (s.get("networks") or {}).values():
+        rx += int(n.get("rx_bytes", 0)); tx += int(n.get("tx_bytes", 0))
+    return {"cpu": round(cpu, 2), "rx": rx, "tx": tx}
+
+
+def update_idle(name: str, stats: dict, policy: dict) -> tuple[bool, int | None]:
+    t = now()
+    with conn() as c:
+        old = c.execute("SELECT * FROM runtime_samples WHERE container_name=?", (name,)).fetchone()
+        network_quiet = True
+        if old:
+            network_quiet = (stats["rx"] - old["rx"] < 1024 * 256 and stats["tx"] - old["tx"] < 1024 * 256)
+        low = stats["cpu"] <= float(policy["idle_cpu"]) and network_quiet
+        idle_since = (old["idle_since"] if old and old["idle_since"] else t) if low else None
+        c.execute("""INSERT INTO runtime_samples(container_name,ts,cpu,rx,tx,idle_since) VALUES(?,?,?,?,?,?)
+          ON CONFLICT(container_name) DO UPDATE SET ts=excluded.ts,cpu=excluded.cpu,rx=excluded.rx,tx=excluded.tx,idle_since=excluded.idle_since""",
+                  (name, t, stats["cpu"], stats["rx"], stats["tx"], idle_since))
+    idle = bool(idle_since and t - idle_since >= int(policy["idle_minutes"]) * 60)
+    return idle, idle_since
+
+
+async def snapshot(name: str, reason: str) -> int:
+    obj = await inspect_container(name)
+    with conn() as c:
+        cur = c.execute("INSERT INTO snapshots(ts,container_name,reason,inspect_json) VALUES(?,?,?,?)",
+                        (now(), name, reason, json.dumps(obj, default=str)))
+        sid = cur.lastrowid
+    event("snapshot", name, {"id": sid, "reason": reason})
+    return sid
+
+
+async def notify(title: str, body: str, severity: str = "info") -> None:
+    payload = {"title": title, "body": body, "severity": severity, "ts": now()}
+    async with httpx.AsyncClient(timeout=10) as client:
+        if DISCORD_WEBHOOK:
+            try:
+                await client.post(DISCORD_WEBHOOK, json={"content": f"👑 **{title}**\n{body}"})
+            except Exception as e:
+                event("notify_error", "discord", str(e), "warning")
+        if N8N_WEBHOOK:
+            try:
+                await client.post(N8N_WEBHOOK, json=payload)
+            except Exception as e:
+                event("notify_error", "n8n", str(e), "warning")
+
+
+async def ensure_quarantine_network() -> None:
+    r = await docker("GET", f"/networks/{quote(QUARANTINE_NETWORK, safe='')}")
+    if r.status_code == 200:
+        return
+    r = await docker("POST", "/networks/create", json={"Name": QUARANTINE_NETWORK, "Internal": True, "CheckDuplicate": True})
+    if r.status_code not in (201, 409):
+        raise HTTPException(r.status_code, r.text)
+
+
+async def isolate(name: str) -> dict:
+    policy = default_policy(name)
+    if policy["protected"]:
+        raise HTTPException(409, "Protected container cannot be isolated automatically")
+    await snapshot(name, "pre-isolation")
+    obj = await inspect_container(name)
+    await ensure_quarantine_network()
+    original = list((obj.get("NetworkSettings", {}).get("Networks") or {}).keys())
+    r = await docker("POST", f"/networks/{quote(QUARANTINE_NETWORK, safe='')}/connect", json={"Container": name})
+    if r.status_code not in (200, 201, 403):
+        raise HTTPException(r.status_code, r.text)
+    disconnected = []
+    for net in original:
+        if net == QUARANTINE_NETWORK:
+            continue
+        rr = await docker("POST", f"/networks/{quote(net, safe='')}/disconnect", json={"Container": name, "Force": True})
+        if rr.status_code in (200, 201):
+            disconnected.append(net)
+    event("security", name, {"action": "isolated", "from": disconnected}, "critical")
+    await notify("Container isolated", f"{name} was moved to {QUARANTINE_NETWORK}. Original networks: {', '.join(disconnected)}", "critical")
+    return {"ok": True, "isolated": name, "disconnected": disconnected}
+
+
+async def restore_networks_from_snapshot(name: str) -> dict:
+    with conn() as c:
+        r = c.execute("SELECT * FROM snapshots WHERE container_name=? AND reason='pre-isolation' ORDER BY id DESC LIMIT 1", (name,)).fetchone()
+    if not r:
+        raise HTTPException(404, "No pre-isolation snapshot")
+    obj = json.loads(r["inspect_json"])
+    networks = list((obj.get("NetworkSettings", {}).get("Networks") or {}).keys())
+    restored = []
+    for net in networks:
+        rr = await docker("POST", f"/networks/{quote(net, safe='')}/connect", json={"Container": name})
+        if rr.status_code in (200, 201, 403):
+            restored.append(net)
+    await docker("POST", f"/networks/{quote(QUARANTINE_NETWORK, safe='')}/disconnect", json={"Container": name, "Force": True})
+    event("recovery", name, {"action": "networks_restored", "networks": restored})
+    return {"ok": True, "restored": restored}
+
+
+async def trivy_scan(name: str) -> dict:
+    obj = await inspect_container(name)
+    image = obj.get("Config", {}).get("Image") or ""
+    if not image:
+        raise HTTPException(400, "Container has no image reference")
+    create = await docker_json("POST", f"/containers/{quote(TRIVY_RUNNER, safe='')}/exec", ok=(201,), json={
+        "AttachStdout": True, "AttachStderr": True,
+        "Cmd": ["trivy", "image", "--quiet", "--format", "json", "--scanners", "vuln", image]
+    })
+    exid = create["Id"]
+    r = await docker("POST", f"/exec/{exid}/start", json={"Detach": False, "Tty": False})
+    raw = r.content.decode("utf-8", errors="ignore")
+    # Docker multiplexed stream may add binary frame headers. JSON begins at first {.
+    p = raw.find("{")
+    if p >= 0:
+        raw = raw[p:]
+    status = "ok" if r.status_code == 200 else "error"
+    critical = high = medium = 0
+    result: Any = {"raw": raw[-12000:]}
     try:
-        result = docker_service.containers()
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f'Docker unavailable: {exc}') from exc
-    return [enrich(item) for item in result]
-
-
-@app.get('/api/stacks')
-def stacks():
-    try:
-        items = [enrich(item) for item in docker_service.containers()]
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f'Docker unavailable: {exc}') from exc
-    grouped = {}
-    for item in items:
-        stack = item['classification'].get('stack') or 'standalone'
-        grouped.setdefault(stack, []).append(item)
-    return {'stacks': grouped}
-
-
-@app.get('/api/containers/{name}')
-def container_detail(name: str):
-    try:
-        base = next(item for item in docker_service.containers() if item['name'] == name)
-        return {**docker_service.inspect(name), **enrich(base)}
-    except StopIteration as exc:
-        raise HTTPException(status_code=404, detail='container not found') from exc
-    except Exception as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
-@app.get('/api/integrations')
-def integrations_api():
-    return {
-        'catalog': integration_catalog(),
-        'configured': integration_service.list(),
-    }
-
-
-@app.post('/api/integrations/{integration_id}/test')
-def test_integration_api(integration_id: int):
-    return integration_service.test(integration_id)
-
-
-@app.get('/api/security')
-def security_status():
-    return {'integrations': security_registry.status()}
-
-
-@app.get('/api/workflows')
-def workflow_status():
-    return {'workflows': workflow_engine.list_workflows()}
-
-
-@app.get('/integrations', response_class=HTMLResponse)
-def integrations_page(message: str = ''):
-    configured = integration_service.list()
-    catalog = integration_catalog()
-    try:
-        container_names = [c['name'] for c in docker_service.containers()]
+        result = json.loads(raw)
+        for section in result.get("Results") or []:
+            for v in section.get("Vulnerabilities") or []:
+                sev = (v.get("Severity") or "").upper()
+                critical += sev == "CRITICAL"; high += sev == "HIGH"; medium += sev == "MEDIUM"
     except Exception:
-        container_names = []
-
-    cards = []
-    for item in configured:
-        cards.append(
-            "<div class='card'>"
-            f"<h3>{escape(item['name'])}</h3>"
-            f"<p><b>Type:</b> {escape(item['kind'])}<br>"
-            f"<b>Container:</b> {escape(item.get('container_name') or 'not linked')}<br>"
-            f"<b>Mode:</b> {escape(item['permission_mode'])}<br>"
-            f"<b>URL:</b> {escape(item['base_url'])}<br>"
-            f"<b>Credential:</b> {escape(item['credential_masked'])}</p>"
-            f"<form method='post' action='/integrations/{item['id']}/test' class='inline'><button>Test</button></form> "
-            f"<form method='post' action='/integrations/{item['id']}/delete' class='inline' onsubmit=\"return confirm('Delete this integration?')\"><button class='danger'>Delete</button></form>"
-            "</div>"
-        )
-
-    type_options = ''.join(
-        f"<option value='{escape(x['type'])}'>{escape(x['name'])}</option>" for x in catalog
-    )
-    container_options = "<option value=''>-- choose container --</option>" + ''.join(
-        f"<option value='{escape(name)}'>{escape(name)}</option>" for name in container_names
-    )
-    notice = f"<div class='notice'>{escape(message)}</div>" if message else ''
-
-    html = f'''<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Kingdom Manager Integrations</title>
-<style>
-body{{font-family:system-ui;background:#11131a;color:#eee;margin:2rem;max-width:1100px}}a{{color:#bba7ff}}.sub{{color:#aaa}}
-.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:1rem}}.card{{background:#191c25;border:1px solid #2b3040;border-radius:.8rem;padding:1rem}}
-form.panel{{background:#191c25;border:1px solid #2b3040;border-radius:.8rem;padding:1rem;margin-top:1rem}}label{{display:block;margin:.7rem 0 .25rem;color:#c6b7ff}}input,select{{width:100%;box-sizing:border-box;padding:.65rem;background:#101219;color:#eee;border:1px solid #394052;border-radius:.45rem}}
-button{{padding:.55rem .8rem;background:#3f326d;color:white;border:0;border-radius:.45rem;cursor:pointer}}.danger{{background:#6c2424}}.inline{{display:inline}}.notice{{background:#183c2b;border:1px solid #2c6b4b;padding:.8rem;border-radius:.6rem;margin:1rem 0}}
-.warn{{background:#402f13;border:1px solid #72541c;padding:1rem;border-radius:.6rem}}code{{color:#d5c8ff}}
-</style></head><body>
-<p><a href='/'>← Dashboard</a></p>
-<h1>🔌 Integrations</h1><p class='sub'>v0.3 · least-privilege service awareness</p>
-<div class='warn'><b>Local-server security:</b> Kingdom Manager can store service API credentials. Keep it on a trusted LAN/VPN, never expose it directly to the public Internet, and grant only the minimum read permissions needed for activity detection. Credentials are encrypted at rest and masked in the UI.</div>
-{notice}
-<h2>Configured</h2><div class='grid'>{''.join(cards) if cards else "<div class='card'>No integrations configured yet.</div>"}</div>
-<h2>Add integration</h2>
-<form class='panel' method='post' action='/integrations'>
-<label>Integration type</label><select name='kind' id='kind'>{type_options}</select>
-<label>Display name</label><input name='name' placeholder='Jellyfin'>
-<label>Container</label><select name='container_name'>{container_options}</select>
-<label>Internal service URL</label><input name='base_url' placeholder='http://jellyfin:8096' required>
-<label>Permission mode</label><select name='permission_mode'><option>MONITOR</option><option>OBSERVE</option><option>MANAGE</option><option>PROTECTED</option></select>
-<label>API key / bearer token</label><input type='password' name='credential' autocomplete='new-password' placeholder='Stored encrypted; leave blank only if endpoint needs no auth'>
-<h3>Generic HTTP options</h3><p class='sub'>Only used when Integration type is Generic HTTP.</p>
-<label>Status path</label><input name='generic_path' placeholder='/api/status'>
-<label>JSON field</label><input name='generic_field' placeholder='jobs.running'>
-<label>Busy comparison</label><select name='generic_operator'><option value='gt'>&gt;</option><option value='gte'>&gt;=</option><option value='eq'>=</option><option value='ne'>!=</option><option value='lt'>&lt;</option><option value='lte'>&lt;=</option></select>
-<label>Comparison value</label><input name='generic_value' value='0'>
-<p><button type='submit'>Save integration</button></p>
-</form>
-</body></html>'''
-    return HTMLResponse(html)
+        status = "error"
+    with conn() as c:
+        c.execute("INSERT INTO scans(ts,container_name,image,status,critical,high,medium,result_json) VALUES(?,?,?,?,?,?,?,?)",
+                  (now(), name, image, status, critical, high, medium, json.dumps(result, default=str)[:500000]))
+    event("trivy", name, {"image": image, "critical": critical, "high": high, "medium": medium, "status": status}, "warning" if critical or high else "info")
+    return {"container": name, "image": image, "status": status, "critical": critical, "high": high, "medium": medium}
 
 
-@app.post('/integrations')
-def create_integration(
-    kind: str = Form(...),
-    name: str = Form(''),
-    container_name: str = Form(''),
-    base_url: str = Form(...),
-    permission_mode: str = Form('MONITOR'),
-    credential: str = Form(''),
-    generic_path: str = Form(''),
-    generic_field: str = Form(''),
-    generic_operator: str = Form('gt'),
-    generic_value: str = Form('0'),
-):
-    settings_map = {}
-    if kind == 'generic_http':
-        settings_map = {
-            'path': generic_path,
-            'field': generic_field,
-            'operator': generic_operator,
-            'value': generic_value,
-        }
+async def pull_image(image: str) -> dict:
+    # Works for public registries. Private registry auth can be added later without storing credentials in the DB.
+    before = None
+    r0 = await docker("GET", f"/images/{quote(image, safe='')}/json")
+    if r0.status_code == 200:
+        before = r0.json().get("Id")
+    r = await docker("POST", f"/images/create?fromImage={quote(image, safe='')}")
+    if r.status_code not in (200, 201):
+        raise HTTPException(r.status_code, r.text[-2000:])
+    r1 = await docker("GET", f"/images/{quote(image, safe='')}/json")
+    after = r1.json().get("Id") if r1.status_code == 200 else None
+    return {"image": image, "before": before, "after": after, "update_available": bool(before and after and before != after)}
+
+
+async def decision_for_security(source: str, severity: str, name: str | None, message: str) -> dict:
+    sev = severity.lower()
+    decision = "record"
+    execute = False
+    reason = f"{source}: {message}"
+    if name:
+        p = default_policy(name)
+        if sev == "critical":
+            decision = "isolate" if p["auto_isolate"] and not p["protected"] else "recommend_isolation"
+            execute = decision == "isolate"
+        elif sev == "high":
+            decision = "investigate"
+        elif source.lower() == "clamav" and "infect" in message.lower():
+            decision = "isolate" if p["auto_isolate"] and not p["protected"] else "recommend_isolation"
+            execute = decision == "isolate"
+    with conn() as c:
+        cur = c.execute("INSERT INTO decisions(ts,container_name,decision,reason,executed) VALUES(?,?,?,?,?)",
+                        (now(), name, decision, reason, int(execute)))
+        did = cur.lastrowid
+    result = None
+    if execute and name:
+        try:
+            result = await isolate(name)
+        except Exception as e:
+            result = {"error": str(e)}
+    if sev in {"high", "critical"}:
+        await notify(f"Security {severity.upper()}: {source}", f"{name or 'host'} — {message}\nDecision: {decision}", sev)
+    return {"id": did, "decision": decision, "executed": execute, "result": result}
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.get("/health")
+async def health():
+    r = await docker("GET", "/_ping")
+    return {"ok": r.status_code == 200, "version": VERSION, "docker": r.text.strip() if r.status_code == 200 else "down"}
+
+
+@app.get("/api/overview")
+async def overview(authorization: str | None = Header(default=None)):
+    require_token(authorization)
+    cs = await list_containers()
+    running = sum(c["state"] == "running" for c in cs)
+    with conn() as c:
+        sec24 = c.execute("SELECT count(*) FROM security_events WHERE ts>?", (now()-86400,)).fetchone()[0]
+        dec24 = c.execute("SELECT count(*) FROM decisions WHERE ts>?", (now()-86400,)).fetchone()[0]
+        scans = c.execute("SELECT count(*) FROM scans").fetchone()[0]
+    return {"containers": len(cs), "running": running, "stopped": len(cs)-running,
+            "security_24h": sec24, "decisions_24h": dec24, "scans": scans, "version": VERSION}
+
+
+@app.get("/api/containers")
+async def api_containers(authorization: str | None = Header(default=None)):
+    require_token(authorization)
+    cs = await list_containers()
+    for c in cs:
+        c["policy"] = default_policy(c["name"])
+        with conn() as db:
+            s = db.execute("SELECT cpu,idle_since,ts FROM runtime_samples WHERE container_name=?", (c["name"],)).fetchone()
+        c["runtime"] = dict(s) if s else None
+    return cs
+
+
+@app.post("/api/containers/{name}/{action}")
+async def container_action(name: str, action: str, authorization: str | None = Header(default=None)):
+    require_token(authorization)
+    if action not in {"start", "stop", "restart", "pause", "unpause"}:
+        raise HTTPException(400, "Unsupported action")
+    p = default_policy(name)
+    if p["protected"] and action in {"stop", "pause"}:
+        raise HTTPException(409, "Container is protected by Kingdom policy")
+    if action in {"stop", "restart", "pause"}:
+        await snapshot(name, f"pre-{action}")
+    r = await docker("POST", f"/containers/{quote(name, safe='')}/{action}")
+    if r.status_code not in (204, 304):
+        raise HTTPException(r.status_code, r.text[:2000])
+    event("container", name, action)
+    return {"ok": True, "container": name, "action": action}
+
+
+@app.post("/api/containers/{name}/sample")
+async def manual_sample(name: str, authorization: str | None = Header(default=None)):
+    require_token(authorization)
+    p = default_policy(name)
+    s = await sample_stats(name)
+    idle, idle_since = update_idle(name, s, p)
+    return {**s, "idle": idle, "idle_since": idle_since}
+
+
+@app.put("/api/policies/{name}")
+async def set_policy(name: str, request: Request, authorization: str | None = Header(default=None)):
+    require_token(authorization)
+    data = await request.json()
+    allowed = {"auto_restart", "auto_update", "auto_isolate", "allow_rebuild", "protected", "idle_cpu", "idle_minutes"}
+    current = default_policy(name)
+    for k, v in data.items():
+        if k in allowed:
+            current[k] = v
+    with conn() as c:
+        c.execute("""UPDATE policies SET auto_restart=?,auto_update=?,auto_isolate=?,allow_rebuild=?,protected=?,idle_cpu=?,idle_minutes=? WHERE container_name=?""",
+                  (int(bool(current["auto_restart"])), int(bool(current["auto_update"])), int(bool(current["auto_isolate"])),
+                   int(bool(current["allow_rebuild"])), int(bool(current["protected"])), float(current["idle_cpu"]), int(current["idle_minutes"]), name))
+    event("policy", name, data)
+    return default_policy(name)
+
+
+@app.post("/api/security/event")
+async def security_event(request: Request, authorization: str | None = Header(default=None)):
+    require_token(authorization)
+    data = await request.json()
+    source = str(data.get("source", "unknown"))
+    severity = str(data.get("severity", "info")).lower()
+    name = data.get("container") or data.get("container_name")
+    message = str(data.get("message", "security event"))
+    with conn() as c:
+        c.execute("INSERT INTO security_events(ts,source,severity,container_name,message,raw_json) VALUES(?,?,?,?,?,?)",
+                  (now(), source, severity, name, message, json.dumps(data, default=str)[:100000]))
+    event("security_event", name or "host", {"source": source, "message": message}, severity)
+    decision = await decision_for_security(source, severity, name, message)
+    return {"ok": True, "decision": decision}
+
+
+@app.post("/api/security/falco")
+async def falco_webhook(request: Request):
+    # Intended for Falcosidekick on the internal Docker network. No public exposure.
+    data = await request.json()
+    severity = str(data.get("priority", "warning")).lower()
+    if severity in {"emergency", "alert", "critical"}: severity = "critical"
+    elif severity in {"error", "warning"}: severity = "high"
+    else: severity = "info"
+    output_fields = data.get("output_fields") or {}
+    name = output_fields.get("container.name") or output_fields.get("container_name")
+    msg = str(data.get("output", data.get("rule", "Falco event")))
+    with conn() as c:
+        c.execute("INSERT INTO security_events(ts,source,severity,container_name,message,raw_json) VALUES(?,?,?,?,?,?)",
+                  (now(), "falco", severity, name, msg, json.dumps(data, default=str)[:100000]))
+    return await decision_for_security("falco", severity, name, msg)
+
+
+@app.post("/api/containers/{name}/isolate")
+async def api_isolate(name: str, authorization: str | None = Header(default=None)):
+    require_token(authorization)
+    return await isolate(name)
+
+
+@app.post("/api/containers/{name}/restore-networks")
+async def api_restore_networks(name: str, authorization: str | None = Header(default=None)):
+    require_token(authorization)
+    return await restore_networks_from_snapshot(name)
+
+
+@app.post("/api/containers/{name}/trivy")
+async def api_trivy(name: str, authorization: str | None = Header(default=None)):
+    require_token(authorization)
+    return await trivy_scan(name)
+
+
+@app.post("/api/containers/{name}/check-update")
+async def check_update(name: str, authorization: str | None = Header(default=None)):
+    require_token(authorization)
+    obj = await inspect_container(name)
+    image = obj.get("Config", {}).get("Image")
+    result = await pull_image(image)
+    event("update_check", name, result, "info")
+    return result
+
+
+@app.get("/api/integrations")
+async def integrations(authorization: str | None = Header(default=None)):
+    require_token(authorization)
+    result = {"clamav": {"configured": bool(CLAMAV_HOST)}, "crowdsec": {"configured": bool(CROWDSEC_URL)},
+              "wazuh": {"configured": bool(WAZUH_URL)}, "discord": {"configured": bool(DISCORD_WEBHOOK)},
+              "n8n": {"configured": bool(N8N_WEBHOOK)}, "falco": {"configured": True}, "trivy": {"configured": True}}
     try:
-        integration_service.save(
-            integration_id=None,
-            name=name,
-            kind=kind,
-            container_name=container_name,
-            base_url=base_url,
-            permission_mode=permission_mode,
-            credential=credential,
-            settings=settings_map,
-        )
-    except Exception as exc:
-        return RedirectResponse(f'/integrations?message={escape(str(exc))}', status_code=303)
-    return RedirectResponse('/integrations?message=Integration%20saved', status_code=303)
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(CLAMAV_HOST, CLAMAV_PORT), timeout=2)
+        writer.write(b"PING\n"); await writer.drain()
+        resp = await asyncio.wait_for(reader.read(64), timeout=2)
+        writer.close(); await writer.wait_closed()
+        result["clamav"]["status"] = "ok" if b"PONG" in resp else "unknown"
+    except Exception as e:
+        result["clamav"]["status"] = "down"; result["clamav"]["detail"] = str(e)
+    if CROWDSEC_URL:
+        try:
+            async with httpx.AsyncClient(timeout=3, verify=False) as client:
+                h = {"X-Api-Key": CROWDSEC_API_KEY} if CROWDSEC_API_KEY else {}
+                r = await client.get(CROWDSEC_URL.rstrip("/") + "/v1/decisions", headers=h)
+                result["crowdsec"]["status"] = "ok" if r.status_code < 500 else "down"
+                result["crowdsec"]["http"] = r.status_code
+        except Exception as e: result["crowdsec"]["status"] = "down"; result["crowdsec"]["detail"] = str(e)
+    if WAZUH_URL:
+        try:
+            async with httpx.AsyncClient(timeout=3, verify=False) as client:
+                h = {"Authorization": f"Bearer {WAZUH_TOKEN}"} if WAZUH_TOKEN else {}
+                r = await client.get(WAZUH_URL.rstrip("/") + "/", headers=h)
+                result["wazuh"]["status"] = "ok" if r.status_code < 500 else "down"
+                result["wazuh"]["http"] = r.status_code
+        except Exception as e: result["wazuh"]["status"] = "down"; result["wazuh"]["detail"] = str(e)
+    return result
 
 
-@app.post('/integrations/{integration_id}/test')
-def test_integration(integration_id: int):
-    result = integration_service.test(integration_id)
-    prefix = 'OK: ' if result.get('ok') else 'FAILED: '
-    from urllib.parse import quote
-    return RedirectResponse(f"/integrations?message={quote(prefix + result.get('message', 'unknown result'))}", status_code=303)
+@app.get("/api/events")
+async def events(limit: int = 100, authorization: str | None = Header(default=None)):
+    require_token(authorization)
+    with conn() as c:
+        return rowdicts(c.execute("SELECT * FROM events ORDER BY id DESC LIMIT ?", (max(1, min(limit, 500)),)).fetchall())
 
 
-@app.post('/integrations/{integration_id}/delete')
-def delete_integration(integration_id: int):
-    integration_service.delete(integration_id)
-    return RedirectResponse('/integrations?message=Integration%20deleted', status_code=303)
+@app.get("/api/decisions")
+async def decisions(limit: int = 100, authorization: str | None = Header(default=None)):
+    require_token(authorization)
+    with conn() as c:
+        return rowdicts(c.execute("SELECT * FROM decisions ORDER BY id DESC LIMIT ?", (max(1, min(limit, 500)),)).fetchall())
 
 
-@app.get('/', response_class=HTMLResponse)
-def dashboard():
-    try:
-        items = [enrich(item) for item in docker_service.containers()]
-    except Exception as exc:
-        return HTMLResponse(f'<h1>Kingdom Manager</h1><p>Docker unavailable: {escape(str(exc))}</p>', status_code=503)
+@app.get("/api/security/events")
+async def security_events(limit: int = 100, authorization: str | None = Header(default=None)):
+    require_token(authorization)
+    with conn() as c:
+        return rowdicts(c.execute("SELECT id,ts,source,severity,container_name,message FROM security_events ORDER BY id DESC LIMIT ?", (max(1, min(limit, 500)),)).fetchall())
 
-    rows = []
-    for item in items:
-        c = item['classification']
-        a = item['activity']
-        d = item['interruption']
-        rows.append(
-            '<tr>'
-            f"<td>{escape(str(item.get('name', 'unknown')))}</td>"
-            f"<td>{escape(str(item.get('status', 'unknown')))}</td>"
-            f"<td>{escape(str(item.get('health', 'none')))}</td>"
-            f"<td class='image'>{escape(str(item.get('image', 'unknown')))}</td>"
-            f"<td>{escape(str(c.get('category', 'unknown')))}</td>"
-            f"<td>{escape(str(c.get('stack') or 'standalone'))}</td>"
-            f"<td>{escape(str(a.get('state', 'unknown')))}</td>"
-            f"<td><span class='decision {escape(str(d.get('decision', 'WAIT')).lower())}'>{escape(str(d.get('decision', 'WAIT')))}</span></td>"
-            f"<td>{escape(str(a.get('reason', 'no reason available')))}</td>"
-            '</tr>'
-        )
 
-    total = len(items)
-    running = sum(1 for i in items if i.get('status') == 'running')
-    safe = sum(1 for i in items if i.get('interruption', {}).get('safe'))
-    integrations_count = len(integration_service.list())
-    html = f'''<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Kingdom Manager</title>
+@app.get("/api/reports/weekly")
+async def weekly_report(authorization: str | None = Header(default=None)):
+    require_token(authorization)
+    start = now() - 7 * 86400
+    cs = await list_containers()
+    with conn() as c:
+        sec = c.execute("SELECT severity,count(*) n FROM security_events WHERE ts>? GROUP BY severity", (start,)).fetchall()
+        acts = c.execute("SELECT kind,count(*) n FROM events WHERE ts>? GROUP BY kind", (start,)).fetchall()
+        scans = c.execute("SELECT count(*) n,coalesce(sum(critical),0) critical,coalesce(sum(high),0) high FROM scans WHERE ts>?", (start,)).fetchone()
+    return {"period_days": 7, "generated_at": now(), "containers": {"total": len(cs), "running": sum(x['state']=='running' for x in cs)},
+            "security": {r['severity']: r['n'] for r in sec}, "activity": {r['kind']: r['n'] for r in acts}, "trivy": dict(scans)}
+
+
+async def monitor_loop():
+    await asyncio.sleep(20)
+    while True:
+        try:
+            cs = await list_containers()
+            for c in cs:
+                if c["name"] in {"kingdom-manager", "kingdom-manager-docker-api", TRIVY_RUNNER}:
+                    continue
+                p = default_policy(c["name"])
+                if c["state"] == "running":
+                    stats = await sample_stats(c["name"])
+                    idle, idle_since = update_idle(c["name"], stats, p)
+                    # We record idle readiness; auto-update still requires an explicit update check/pull.
+                    if idle:
+                        event("idle", c["name"], {"cpu": stats["cpu"], "idle_since": idle_since})
+                elif p["auto_restart"] and not p["protected"]:
+                    status = (c.get("status") or "").lower()
+                    # Restart only unexpected failures, not clean/manual exits.
+                    if "exited (0)" not in status and "created" not in status:
+                        r = await docker("POST", f"/containers/{quote(c['name'], safe='')}/start")
+                        if r.status_code in (204, 304):
+                            event("recovery", c["name"], "auto-started after unexpected stop", "warning")
+                            await notify("Container recovered", f"{c['name']} was automatically started after an unexpected stop.", "warning")
+        except Exception as e:
+            event("monitor_error", "host", str(e), "warning")
+        await asyncio.sleep(max(60, CHECK_SECONDS))
+
+
+async def weekly_loop():
+    await asyncio.sleep(60)
+    while True:
+        try:
+            local = datetime.now(TZ)
+            weekkey = f"{local.isocalendar().year}-{local.isocalendar().week}"
+            with conn() as c:
+                sent = c.execute("SELECT value FROM settings WHERE key='weekly_sent'").fetchone()
+            if local.weekday() == 0 and local.hour >= 9 and (not sent or sent[0] != weekkey):
+                # Build a compact report without requiring auth internally.
+                start = now() - 7 * 86400
+                cs = await list_containers()
+                with conn() as c:
+                    secn = c.execute("SELECT count(*) FROM security_events WHERE ts>?", (start,)).fetchone()[0]
+                    decn = c.execute("SELECT count(*) FROM decisions WHERE ts>?", (start,)).fetchone()[0]
+                await notify("Kingdom weekly report", f"Containers: {sum(x['state']=='running' for x in cs)}/{len(cs)} running\nSecurity events: {secn}\nDecisions: {decn}")
+                with conn() as c:
+                    c.execute("INSERT INTO settings(key,value) VALUES('weekly_sent',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (weekkey,))
+        except Exception as e:
+            event("weekly_error", "report", str(e), "warning")
+        await asyncio.sleep(3600)
+
+
+@app.on_event("startup")
+async def startup():
+    asyncio.create_task(monitor_loop())
+    asyncio.create_task(weekly_loop())
+
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard():
+    return HTMLResponse(DASHBOARD)
+
+
+DASHBOARD = r'''<!doctype html>
+<html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Kingdom Manager</title>
 <style>
-body{{font-family:system-ui;background:#11131a;color:#eee;margin:2rem}}h1{{margin-bottom:.25rem}}.sub{{color:#aaa;margin-top:0}}a{{color:#c6b7ff}}
-.summary{{display:flex;gap:1rem;flex-wrap:wrap;margin:1rem 0}}.card{{background:#191c25;border:1px solid #2b3040;border-radius:.7rem;padding:.8rem 1rem}}
-table{{border-collapse:collapse;width:100%;background:#191c25}}th,td{{padding:.65rem;border-bottom:1px solid #2b3040;text-align:left;font-size:.86rem;vertical-align:top}}th{{color:#c6b7ff;position:sticky;top:0;background:#191c25}}.image{{max-width:360px;word-break:break-word}}.decision{{padding:.2rem .45rem;border-radius:.35rem;background:#2b3040}}.safe{{background:#164e32}}.wait{{background:#5b4a12}}.locked{{background:#5a1d1d}}
+:root{font-family:Inter,ui-sans-serif,system-ui;color:#f4f0ff;background:#09070d}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top,#211431 0,#0d0a12 42%,#09070d 100%);min-height:100vh}.wrap{max-width:1450px;margin:auto;padding:24px}.top{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap}.brand h1{margin:0;font-size:32px}.muted{color:#a79eb5}.pill{padding:7px 11px;border:1px solid #3f3154;border-radius:999px;background:#17111f}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px;margin-top:16px}.card{grid-column:span 3;background:rgba(24,18,32,.88);border:1px solid #342741;border-radius:16px;padding:16px;box-shadow:0 12px 40px #0005}.wide{grid-column:span 8}.side{grid-column:span 4}.full{grid-column:1/-1}.kpi{font-size:28px;font-weight:800}.good{color:#89e6ac}.bad{color:#ff8d9a}.warn{color:#f2c864}.row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid #2d2338}.row:last-child{border:0}.name{font-weight:700}.tiny{font-size:12px;color:#a79eb5}button,input,select{border:1px solid #49375d;border-radius:9px;background:#1a1322;color:#fff;padding:8px 10px}button{cursor:pointer}button:hover{background:#2c1e3a}.danger{border-color:#7f3340}.gold{color:#e8c260}.toolbar{display:flex;gap:6px;flex-wrap:wrap}.tag{font-size:11px;border:1px solid #41314e;border-radius:999px;padding:3px 7px}.scroll{max-height:560px;overflow:auto}.login{position:fixed;inset:0;background:#09070df2;display:flex;align-items:center;justify-content:center;z-index:5}.loginbox{width:min(420px,92vw);background:#17111f;border:1px solid #443255;border-radius:18px;padding:24px}.loginbox input{width:100%;margin:12px 0}.hidden{display:none!important}pre{white-space:pre-wrap;word-break:break-word;font-size:12px}.sev-critical{color:#ff6f7f}.sev-high{color:#ffc067}@media(max-width:1000px){.card,.wide,.side{grid-column:1/-1}}
 </style></head><body>
-<h1>👑 Kingdom Manager</h1><p class="sub">v0.3 · read-only integrations & policy mode</p>
-<p><a href='/integrations'>🔌 Manage Integrations</a></p>
-<div class="summary"><div class="card">Containers: <b>{total}</b></div><div class="card">Running: <b>{running}</b></div><div class="card">Safe now: <b>{safe}</b></div><div class="card">Integrations: <b>{integrations_count}</b></div></div>
-<table><thead><tr><th>Container</th><th>Status</th><th>Health</th><th>Image</th><th>Class</th><th>Stack</th><th>Activity</th><th>Interrupt</th><th>Reason</th></tr></thead><tbody>{''.join(rows)}</tbody></table>
-</body></html>'''
-    return HTMLResponse(html)
+<div id="login" class="login"><div class="loginbox"><h2>👑 Enter the Kingdom</h2><p class="muted">Paste your <code>KM_API_TOKEN</code>. It stays only in this browser.</p><input id="token" type="password" placeholder="Kingdom Manager token"><button onclick="saveToken()">Unlock Dashboard</button><p id="loginerr" class="bad"></p></div></div>
+<div class="wrap"><div class="top"><div class="brand"><h1>👑 Kingdom Manager</h1><div class="muted">Container Life · Security Engine · Decision Engine · Recovery · Reports</div></div><div class="toolbar"><span id="health" class="pill">Checking…</span><button onclick="logout()">Lock</button></div></div>
+<div class="grid">
+<div class="card"><div class="muted">Containers</div><div id="kTotal" class="kpi">—</div></div><div class="card"><div class="muted">Running</div><div id="kRunning" class="kpi good">—</div></div><div class="card"><div class="muted">Security / 24h</div><div id="kSecurity" class="kpi warn">—</div></div><div class="card"><div class="muted">Decisions / 24h</div><div id="kDecisions" class="kpi gold">—</div></div>
+<div class="card wide"><h2>🐳 Container Life</h2><div id="containers" class="scroll">Loading…</div></div>
+<div class="card side"><h2>🛡️ Security Engines</h2><div id="integrations">Loading…</div><h3>🧠 Decision Engine</h3><div class="muted">Critical events can isolate containers only when that container's policy explicitly enables Auto-Isolate.</div></div>
+<div class="card full"><h2>📜 Recent Kingdom Activity</h2><div id="events" class="scroll"></div></div>
+</div></div>
+<script>
+let TOKEN=localStorage.getItem('km_token')||'';
+function hdr(){return {'Authorization':'Bearer '+TOKEN,'Content-Type':'application/json'}}
+async function api(url,opt={}){opt.headers={...(opt.headers||{}),...hdr()};let r=await fetch(url,opt);if(r.status===401){document.getElementById('login').classList.remove('hidden');throw Error('Unauthorized')}let t=await r.text();let d=t?JSON.parse(t):{};if(!r.ok)throw Error(d.detail||t);return d}
+function saveToken(){TOKEN=document.getElementById('token').value.trim();localStorage.setItem('km_token',TOKEN);load().then(()=>document.getElementById('login').classList.add('hidden')).catch(e=>document.getElementById('loginerr').textContent=e.message)}
+function logout(){localStorage.removeItem('km_token');TOKEN='';document.getElementById('login').classList.remove('hidden')}
+function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
+async function act(n,a){if((a==='stop'||a==='isolate')&&!confirm(`${a.toUpperCase()} ${n}?`))return;try{await api(`/api/containers/${encodeURIComponent(n)}/${a}`,{method:'POST'});await load()}catch(e){alert(e.message)}}
+async function scan(n){try{let d=await api(`/api/containers/${encodeURIComponent(n)}/trivy`,{method:'POST'});alert(`Trivy ${n}: Critical ${d.critical}, High ${d.high}, Medium ${d.medium}`);load()}catch(e){alert(e.message)}}
+async function upd(n){try{let d=await api(`/api/containers/${encodeURIComponent(n)}/check-update`,{method:'POST'});alert(d.update_available?'New image pulled; container has NOT been recreated automatically.':'No image ID change detected.');load()}catch(e){alert(e.message)}}
+async function setFlag(n,k,v){try{await api(`/api/policies/${encodeURIComponent(n)}`,{method:'PUT',body:JSON.stringify({[k]:v})});load()}catch(e){alert(e.message)}}
+function policy(n,p){return `<div class="tiny">Policy: <label><input type="checkbox" ${p.auto_restart?'checked':''} onchange="setFlag('${esc(n)}','auto_restart',this.checked)"> recovery</label> · <label><input type="checkbox" ${p.auto_isolate?'checked':''} onchange="setFlag('${esc(n)}','auto_isolate',this.checked)"> auto-isolate</label> · <label><input type="checkbox" ${p.protected?'checked':''} onchange="setFlag('${esc(n)}','protected',this.checked)"> protected</label></div>`}
+async function load(){
+ let o=await api('/api/overview');document.getElementById('kTotal').textContent=o.containers;document.getElementById('kRunning').textContent=o.running;document.getElementById('kSecurity').textContent=o.security_24h;document.getElementById('kDecisions').textContent=o.decisions_24h;document.getElementById('health').textContent='Kingdom Manager v'+o.version;
+ let cs=await api('/api/containers');document.getElementById('containers').innerHTML=cs.map(c=>`<div class="row"><div><div class="name">${esc(c.name)} <span class="tag ${c.state==='running'?'good':'bad'}">${esc(c.state)}</span></div><div class="tiny">${esc(c.image)} · ${esc(c.status)}</div>${policy(c.name,c.policy)}</div><div class="toolbar"><button onclick="act('${esc(c.name)}','start')">Start</button><button onclick="act('${esc(c.name)}','restart')">Restart</button><button class="danger" onclick="act('${esc(c.name)}','stop')">Stop</button><button onclick="scan('${esc(c.name)}')">Trivy</button><button onclick="upd('${esc(c.name)}')">Update Check</button><button class="danger" onclick="act('${esc(c.name)}','isolate')">Isolate</button></div></div>`).join('');
+ let ins=await api('/api/integrations');document.getElementById('integrations').innerHTML=Object.entries(ins).map(([k,v])=>`<div class="row"><span>${esc(k)}</span><span class="tag ${v.status==='ok'?'good':v.status==='down'?'bad':''}">${esc(v.status|| (v.configured?'ready':'not configured'))}</span></div>`).join('');
+ let ev=await api('/api/events?limit=80');document.getElementById('events').innerHTML=ev.map(e=>`<div class="row"><div><b class="sev-${esc(e.severity)}">${esc(e.kind)}</b> · ${esc(e.subject)}<div class="tiny">${new Date(e.ts*1000).toLocaleString()} · ${esc(e.detail)}</div></div></div>`).join('');
+}
+if(TOKEN){load().then(()=>document.getElementById('login').classList.add('hidden')).catch(()=>{})}
+setInterval(()=>{if(TOKEN)load().catch(()=>{})},30000)
+</script></body></html>'''

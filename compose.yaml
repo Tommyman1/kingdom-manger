@@ -1,70 +1,118 @@
 services:
-  socket-proxy:
-    image: ghcr.io/tecnativa/docker-socket-proxy:v0.4.1
-    container_name: kingdom-socket-proxy
-    restart: unless-stopped
-    environment:
-      CONTAINERS: "1"
-      INFO: "1"
-      IMAGES: "1"
-      NETWORKS: "1"
-      VERSION: "1"
-      EVENTS: "1"
-      POST: "0"
-      AUTH: "0"
-      SECRETS: "0"
-      SERVICES: "0"
-      SWARM: "0"
-      SYSTEM: "0"
-      VOLUMES: "0"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    networks:
-      - kingdom-internal
-    read_only: true
-    tmpfs:
-      - /run
-      - /tmp
-
   kingdom-manager:
     build:
-      context: .
+      context: ./app
       dockerfile: Dockerfile
-    image: kingdom-manager:0.3.0
+    image: kingdom-manager:1.0.0
     container_name: kingdom-manager
     restart: unless-stopped
-    depends_on:
-      - socket-proxy
     environment:
       TZ: America/New_York
-      DOCKER_HOST: tcp://socket-proxy:2375
-      DATABASE_PATH: /data/kingdom.db
-      ENABLE_MUTATIONS: "false"
-      IDLE_DEFAULT_SECONDS: "900"
-      JELLYFIN_URL: http://jellyfin:8096
-      JELLYFIN_API_KEY: ${JELLYFIN_API_KEY:-}
-      JELLYFIN_IDLE_SECONDS: "1800"
+      KM_DATA_DIR: /data
+      KM_API_TOKEN: ${KM_API_TOKEN:?Set KM_API_TOKEN in .env}
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
+      KM_QUARANTINE_NETWORK: kingdom-quarantine
+      KM_CHECK_SECONDS: ${KM_CHECK_SECONDS:-300}
+      KM_IDLE_CPU_PERCENT: ${KM_IDLE_CPU_PERCENT:-3.0}
+      KM_IDLE_MINUTES: ${KM_IDLE_MINUTES:-20}
+      TRIVY_RUNNER: kingdom-manager-trivy
+      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
+      N8N_WEBHOOK_URL: ${N8N_WEBHOOK_URL:-}
+      CLAMAV_HOST: ${CLAMAV_HOST:-clamav}
+      CLAMAV_PORT: ${CLAMAV_PORT:-3310}
+      CROWDSEC_URL: ${CROWDSEC_URL:-}
+      CROWDSEC_API_KEY: ${CROWDSEC_API_KEY:-}
+      WAZUH_URL: ${WAZUH_URL:-}
+      WAZUH_TOKEN: ${WAZUH_TOKEN:-}
     volumes:
       - kingdom-manager-data:/data
-    expose:
-      - "8000"
     networks:
-      - kingdom-internal
       - proxy
+      - kingdom-manager-internal
+    depends_on:
+      docker-socket-proxy:
+        condition: service_started
+      trivy-runner:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     labels:
-      homepage.group: Infrastructure
+      homepage.group: Management
       homepage.name: Kingdom Manager
-      homepage.description: Container lifecycle, security, and automation manager
+      homepage.description: Docker lifecycle, security decisions, recovery, scans, and reporting
       homepage.icon: mdi-crown
       homepage.href: https://kingdom-manager-tail.kingdom.local
 
-networks:
-  kingdom-internal:
-    name: kingdom-internal
-    internal: true
-  proxy:
-    external: true
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: kingdom-manager-docker-api
+    restart: unless-stopped
+    environment:
+      CONTAINERS: 1
+      IMAGES: 1
+      INFO: 1
+      NETWORKS: 1
+      EVENTS: 1
+      PING: 1
+      VERSION: 1
+      POST: 1
+      DELETE: 0
+      EXEC: 1
+      BUILD: 0
+      COMMIT: 0
+      CONFIGS: 0
+      DISTRIBUTION: 0
+      NODES: 0
+      PLUGINS: 0
+      SECRETS: 0
+      SESSION: 0
+      SWARM: 0
+      SYSTEM: 0
+      VOLUMES: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - kingdom-manager-internal
+    security_opt:
+      - no-new-privileges:true
+
+  trivy-runner:
+    image: aquasec/trivy:latest
+    container_name: kingdom-manager-trivy
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["sleep infinity"]
+    environment:
+      TZ: America/New_York
+      TRIVY_CACHE_DIR: /root/.cache/trivy
+    volumes:
+      - trivy-cache:/root/.cache/trivy
+    networks:
+      - kingdom-manager-internal
+      - kingdom-manager-egress
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
 
 volumes:
   kingdom-manager-data:
     name: kingdom-manager-data
+  trivy-cache:
+    name: kingdom-manager-trivy-cache
+
+networks:
+  proxy:
+    external: true
+  kingdom-manager-internal:
+    name: kingdom-manager-internal
+    internal: true
+  kingdom-quarantine:
+    name: kingdom-quarantine
+    internal: true
+  kingdom-manager-egress:
+    name: kingdom-manager-egress
