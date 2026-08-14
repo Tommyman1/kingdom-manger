@@ -3,31 +3,31 @@ services:
     build:
       context: ./app
       dockerfile: Dockerfile
-    image: kingdom-manager:1.0.0
+    image: kingdom-manager:1.2.0
     container_name: kingdom-manager
     restart: unless-stopped
     environment:
       TZ: America/New_York
       KM_DATA_DIR: /data
-      KM_API_TOKEN: ${KM_API_TOKEN:?Set KM_API_TOKEN in .env}
+      KM_API_TOKEN: "kingdom-manager-change-this-2026"
       DOCKER_HOST: tcp://docker-socket-proxy:2375
       KM_QUARANTINE_NETWORK: kingdom-quarantine
-      KM_CHECK_SECONDS: ${KM_CHECK_SECONDS:-300}
-      KM_IDLE_CPU_PERCENT: ${KM_IDLE_CPU_PERCENT:-3.0}
-      KM_IDLE_MINUTES: ${KM_IDLE_MINUTES:-20}
+      KM_CHECK_SECONDS: "300"
+      KM_IDLE_CPU_PERCENT: "3.0"
+      KM_IDLE_MINUTES: "20"
       TRIVY_RUNNER: kingdom-manager-trivy
-      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
-      N8N_WEBHOOK_URL: ${N8N_WEBHOOK_URL:-}
-      CLAMAV_HOST: ${CLAMAV_HOST:-clamav}
-      CLAMAV_PORT: ${CLAMAV_PORT:-3310}
-      CROWDSEC_URL: ${CROWDSEC_URL:-}
-      CROWDSEC_API_KEY: ${CROWDSEC_API_KEY:-}
-      WAZUH_URL: ${WAZUH_URL:-}
-      WAZUH_TOKEN: ${WAZUH_TOKEN:-}
+      DISCORD_WEBHOOK_URL: ""
+      N8N_WEBHOOK_URL: ""
+      CLAMAV_HOST: clamav
+      CLAMAV_PORT: "3310"
+      CROWDSEC_URL: "http://172.24.0.1:8080"
+      CROWDSEC_API_KEY: "PASTE_YOUR_EXISTING_KINGDOM_MANAGER_BOUNCER_KEY_HERE"
+      FALCO_WEBHOOK_SECRET: "kingdom-falco-2026-change-this"
     volumes:
       - kingdom-manager-data:/data
     networks:
       - proxy
+      - security
       - kingdom-manager-internal
     depends_on:
       docker-socket-proxy:
@@ -41,7 +41,7 @@ services:
       retries: 5
       start_period: 20s
     labels:
-      homepage.group: Management
+      homepage.group: Network
       homepage.name: Kingdom Manager
       homepage.description: Docker lifecycle, security decisions, recovery, scans, and reporting
       homepage.icon: mdi-crown
@@ -80,8 +80,41 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  trivy-socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: kingdom-manager-trivy-docker-api
+    restart: unless-stopped
+    environment:
+      CONTAINERS: 0
+      IMAGES: 1
+      INFO: 1
+      NETWORKS: 0
+      EVENTS: 0
+      PING: 1
+      VERSION: 1
+      POST: 0
+      DELETE: 0
+      EXEC: 0
+      BUILD: 0
+      COMMIT: 0
+      CONFIGS: 0
+      DISTRIBUTION: 0
+      NODES: 0
+      PLUGINS: 0
+      SECRETS: 0
+      SESSION: 0
+      SWARM: 0
+      SYSTEM: 0
+      VOLUMES: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - trivy-control
+    security_opt:
+      - no-new-privileges:true
+
   trivy-runner:
-    image: aquasec/trivy:latest
+    image: aquasec/trivy:0.74.0
     container_name: kingdom-manager-trivy
     restart: unless-stopped
     entrypoint: ["/bin/sh", "-c"]
@@ -89,11 +122,16 @@ services:
     environment:
       TZ: America/New_York
       TRIVY_CACHE_DIR: /root/.cache/trivy
+      DOCKER_HOST: tcp://trivy-socket-proxy:2375
     volumes:
       - trivy-cache:/root/.cache/trivy
     networks:
       - kingdom-manager-internal
+      - trivy-control
       - kingdom-manager-egress
+    depends_on:
+      trivy-socket-proxy:
+        condition: service_started
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -108,6 +146,8 @@ volumes:
 networks:
   proxy:
     external: true
+  security:
+    external: true
   kingdom-manager-internal:
     name: kingdom-manager-internal
     internal: true
@@ -116,3 +156,6 @@ networks:
     internal: true
   kingdom-manager-egress:
     name: kingdom-manager-egress
+  trivy-control:
+    name: kingdom-manager-trivy-control
+    internal: true

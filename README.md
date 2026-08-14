@@ -1,82 +1,20 @@
-# 👑 Kingdom Manager v1
+# Kingdom Manager v1.2
 
-Kingdom Manager is the control plane for the Kingdom Docker host. It does not replace Docker, ClamAV, CrowdSec, Falco, Wazuh, Trivy, or n8n; it coordinates them.
+Adds direct Falco -> Kingdom Manager event ingestion over the existing `security` Docker network.
 
-## What is implemented
+## Changes
+- Falco webhook is protected by `FALCO_WEBHOOK_SECRET`.
+- Dashboard reports Falco `ok`, `stale`, or `waiting` based on actual received events.
+- Dashboard shows Falco 24-hour severity counts and recent detections.
+- Dockerfile fixes `/data` ownership automatically at startup before dropping privileges.
 
-- Container inventory and health/state dashboard
-- Start, stop, restart, pause/unpause API
-- Per-container safety policies
-- CPU/network idle sampling
-- Unexpected-stop auto-recovery (policy controlled)
-- Docker configuration snapshots before disruptive actions
-- Quarantine network isolation and network restoration
-- Security-event ingestion and decision recording
-- Falcosidekick webhook receiver
-- Trivy image scans through an isolated runner
-- Public-image update checks by pulling without recreating the container
-- ClamAV / CrowdSec / Wazuh connectivity status
-- Discord + n8n notification hooks
-- Persistent SQLite event, policy, scan, decision, and snapshot history
-- Automatic Monday weekly report notification
-- Token-protected management API/dashboard
+## Important
+Keep the same secret in both `compose.yaml` (`FALCO_WEBHOOK_SECRET`) and `falco-compose.yaml` (`token=` in the HTTP output URL).
+Preserve your existing CrowdSec bouncer key when updating the Kingdom Manager compose.
 
-## Deliberate safety gates
 
-`auto_isolate` defaults OFF. `auto_update` defaults OFF. A pulled update is never automatically installed in v1. `protected` prevents automatic isolation and some disruptive actions. Container deletion/recreation is intentionally not enabled until a restore test has proven that container's snapshot can be recreated correctly.
+## Trivy integration (v1.2)
 
-This is important: Docker's create-container API cannot safely replay every Compose/Portainer stack from raw inspect data. Kingdom Manager records the snapshot now, but automatic destructive rebuild should be stack-aware before it is enabled.
+Kingdom Manager now treats Trivy as a real security engine instead of a placeholder. A dedicated read-only Docker socket proxy gives the Trivy runner image-read access without lifecycle/write access. Scans prefer local Docker images and fall back to registries, persist normalized CVE findings, show 24-hour Critical/High/Medium counts, and feed update recommendations into the Decision Engine. Trivy findings never auto-isolate a running container because a vulnerable image is not evidence of an active compromise.
 
-## Install on Kingdom
-
-```bash
-mkdir -p /home/tommytheog/Docker/kingdom-manager
-cd /home/tommytheog/Docker/kingdom-manager
-# copy the contents of this package here
-cp .env.example .env
-TOKEN=$(openssl rand -hex 32)
-sed -i "s/CHANGE_ME_TO_A_LONG_RANDOM_TOKEN/$TOKEN/" .env
-printf '\nKingdom Manager token: %s\n' "$TOKEN"
-docker compose up -d --build
-```
-
-## Nginx Proxy Manager
-
-- Domain: `kingdom-manager-tail.kingdom.local`
-- Scheme: `http`
-- Forward hostname: `kingdom-manager`
-- Forward port: `8080`
-- Websockets: on
-- Keep it internal/Tailscale only.
-
-## Connect existing ClamAV / CrowdSec / Wazuh
-
-Kingdom Manager must share a Docker network with a service before it can address that service by container name. Do **not** expose their API ports on the host just to make the integration work. Instead, attach Kingdom Manager to the required internal network or attach the service to `kingdom-manager-internal` when appropriate.
-
-Example:
-
-```bash
-docker network connect kingdom-manager-internal clamav
-```
-
-For CrowdSec/Wazuh, set their internal URL and API credential in `.env`.
-
-## Falco
-
-Point Falcosidekick's webhook output to:
-
-`http://kingdom-manager:8080/api/security/falco`
-
-Keep Falcosidekick on a network that can reach Kingdom Manager; the endpoint is intended for internal Docker traffic.
-
-## Trivy
-
-The included Trivy runner scans image references from the registry and keeps its vulnerability DB cache in a Docker volume. Custom local-only images that do not exist in a registry cannot be scanned by this runner mode yet.
-
-## API token
-
-The dashboard asks for `KM_API_TOKEN` once and stores it in browser local storage. Do not share the token. For additional defense, keep NPM access restricted to your Tailscale/internal DNS path.
-
-## First policy recommendation
-
-Keep `protected` ON for infrastructure such as Nginx Proxy Manager, Tailscale, Portainer, databases, Kingdom Manager itself, and other stateful services until each recovery path is tested. Enable `auto_isolate` only on containers where losing network access is preferable to continued operation during a critical alert.
+The first scan can take longer while Trivy downloads its vulnerability database into the persistent `trivy-cache` volume.

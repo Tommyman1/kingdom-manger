@@ -15,7 +15,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-VERSION = "1.0.0"
+VERSION = "1.2.0"
 app = FastAPI(title="Kingdom Manager", version=VERSION)
 
 DOCKER = os.getenv("DOCKER_HOST", "tcp://docker-socket-proxy:2375").replace("tcp://", "http://")
@@ -34,8 +34,7 @@ CLAMAV_HOST = os.getenv("CLAMAV_HOST", "clamav")
 CLAMAV_PORT = int(os.getenv("CLAMAV_PORT", "3310"))
 CROWDSEC_URL = os.getenv("CROWDSEC_URL", "")
 CROWDSEC_API_KEY = os.getenv("CROWDSEC_API_KEY", "")
-WAZUH_URL = os.getenv("WAZUH_URL", "")
-WAZUH_TOKEN = os.getenv("WAZUH_TOKEN", "")
+FALCO_WEBHOOK_SECRET = os.getenv("FALCO_WEBHOOK_SECRET", "")
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -87,6 +86,12 @@ def init_db() -> None:
           container_name TEXT, image TEXT NOT NULL, status TEXT NOT NULL,
           critical INTEGER DEFAULT 0, high INTEGER DEFAULT 0, medium INTEGER DEFAULT 0,
           result_json TEXT
+        );
+        CREATE TABLE IF NOT EXISTS scan_findings(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id INTEGER NOT NULL,
+          container_name TEXT, image TEXT NOT NULL, target TEXT, vuln_id TEXT,
+          pkg_name TEXT, installed_version TEXT, fixed_version TEXT, severity TEXT, title TEXT,
+          FOREIGN KEY(scan_id) REFERENCES scans(id) ON DELETE CASCADE
         );
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
         """)
@@ -265,38 +270,95 @@ async def restore_networks_from_snapshot(name: str) -> dict:
     return {"ok": True, "restored": restored}
 
 
+async def trivy_exec(cmd: list[str], timeout: int = 900) -> tuple[int, str]:
+    """Run Trivy inside the dedicated runner through Docker exec."""
+    create = await docker_json("POST", f"/containers/{quote(TRIVY_RUNNER, safe='')}/exec", ok=(201,), json={
+        "AttachStdout": True, "AttachStderr": True, "Cmd": cmd
+    })
+    exid = create["Id"]
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.post(DOCKER + f"/exec/{exid}/start", json={"Detach": False, "Tty": False})
+    raw = r.content.decode("utf-8", errors="ignore")
+    # Docker's non-TTY exec stream may contain 8-byte multiplexing frame headers.
+    # Trivy JSON starts at the first '{'.
+    p = raw.find("{")
+    if p >= 0:
+        raw = raw[p:]
+    inspect = await docker("GET", f"/exec/{exid}/json")
+    exit_code = inspect.json().get("ExitCode", 1) if inspect.status_code == 200 else (0 if r.status_code == 200 else 1)
+    return int(exit_code or 0), raw
+
+
 async def trivy_scan(name: str) -> dict:
     obj = await inspect_container(name)
     image = obj.get("Config", {}).get("Image") or ""
     if not image:
         raise HTTPException(400, "Container has no image reference")
-    create = await docker_json("POST", f"/containers/{quote(TRIVY_RUNNER, safe='')}/exec", ok=(201,), json={
-        "AttachStdout": True, "AttachStderr": True,
-        "Cmd": ["trivy", "image", "--quiet", "--format", "json", "--scanners", "vuln", image]
-    })
-    exid = create["Id"]
-    r = await docker("POST", f"/exec/{exid}/start", json={"Detach": False, "Tty": False})
-    raw = r.content.decode("utf-8", errors="ignore")
-    # Docker multiplexed stream may add binary frame headers. JSON begins at first {.
-    p = raw.find("{")
-    if p >= 0:
-        raw = raw[p:]
-    status = "ok" if r.status_code == 200 else "error"
-    critical = high = medium = 0
-    result: Any = {"raw": raw[-12000:]}
+
+    # Prefer the local Docker image exposed through the dedicated read-only socket proxy;
+    # fall back to the registry for images that are not present locally.
+    cmd = [
+        "trivy", "image", "--quiet", "--format", "json",
+        "--scanners", "vuln", "--image-src", "docker,remote",
+        "--timeout", "10m", image,
+    ]
+    exit_code, raw = await trivy_exec(cmd, timeout=720)
+    status = "ok" if exit_code == 0 else "error"
+    counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "unknown": 0}
+    result: Any = {"raw": raw[-20000:]}
+    findings: list[dict] = []
     try:
         result = json.loads(raw)
         for section in result.get("Results") or []:
+            target = str(section.get("Target") or "")
             for v in section.get("Vulnerabilities") or []:
-                sev = (v.get("Severity") or "").upper()
-                critical += sev == "CRITICAL"; high += sev == "HIGH"; medium += sev == "MEDIUM"
-    except Exception:
+                sev = str(v.get("Severity") or "UNKNOWN").lower()
+                if sev in counts:
+                    counts[sev] += 1
+                findings.append({
+                    "target": target,
+                    "vuln_id": str(v.get("VulnerabilityID") or ""),
+                    "pkg_name": str(v.get("PkgName") or ""),
+                    "installed_version": str(v.get("InstalledVersion") or ""),
+                    "fixed_version": str(v.get("FixedVersion") or ""),
+                    "severity": sev,
+                    "title": str(v.get("Title") or v.get("Description") or "")[:1000],
+                })
+    except Exception as e:
         status = "error"
+        result = {"error": str(e), "raw": raw[-20000:]}
+
     with conn() as c:
-        c.execute("INSERT INTO scans(ts,container_name,image,status,critical,high,medium,result_json) VALUES(?,?,?,?,?,?,?,?)",
-                  (now(), name, image, status, critical, high, medium, json.dumps(result, default=str)[:500000]))
-    event("trivy", name, {"image": image, "critical": critical, "high": high, "medium": medium, "status": status}, "warning" if critical or high else "info")
-    return {"container": name, "image": image, "status": status, "critical": critical, "high": high, "medium": medium}
+        cur = c.execute(
+            "INSERT INTO scans(ts,container_name,image,status,critical,high,medium,result_json) VALUES(?,?,?,?,?,?,?,?)",
+            (now(), name, image, status, counts["critical"], counts["high"], counts["medium"], json.dumps(result, default=str)[:1000000])
+        )
+        scan_id = cur.lastrowid
+        if status == "ok":
+            c.executemany(
+                "INSERT INTO scan_findings(scan_id,container_name,image,target,vuln_id,pkg_name,installed_version,fixed_version,severity,title) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                [(scan_id, name, image, f["target"], f["vuln_id"], f["pkg_name"], f["installed_version"], f["fixed_version"], f["severity"], f["title"]) for f in findings]
+            )
+
+    sev = "critical" if counts["critical"] else ("high" if counts["high"] else "info")
+    event("trivy", name, {"image": image, **counts, "status": status, "scan_id": scan_id}, sev)
+
+    decision = None
+    if status == "ok" and (counts["critical"] or counts["high"]):
+        # A vulnerable image is not the same thing as an active compromise. Do not isolate it.
+        # Feed a recommendation into the Decision Engine instead.
+        decision_name = "recommend_update" if counts["critical"] else "investigate_update"
+        reason = f"trivy: {counts['critical']} critical and {counts['high']} high vulnerabilities in {image}"
+        with conn() as c:
+            cur = c.execute("INSERT INTO decisions(ts,container_name,decision,reason,executed) VALUES(?,?,?,?,0)",
+                            (now(), name, decision_name, reason))
+            decision = {"id": cur.lastrowid, "decision": decision_name, "executed": False}
+        if counts["critical"]:
+            await notify("Critical image vulnerabilities", f"{name} ({image}) has {counts['critical']} critical and {counts['high']} high findings. No automatic isolation was performed.", "critical")
+
+    top = [f for f in findings if f["severity"] in {"critical", "high"}][:20]
+    return {"scan_id": scan_id, "container": name, "image": image, "status": status, **counts,
+            "total": len(findings), "top_findings": top, "decision": decision}
 
 
 async def pull_image(image: str) -> dict:
@@ -444,8 +506,11 @@ async def security_event(request: Request, authorization: str | None = Header(de
 
 
 @app.post("/api/security/falco")
-async def falco_webhook(request: Request):
-    # Intended for Falcosidekick on the internal Docker network. No public exposure.
+async def falco_webhook(request: Request, token: str = ""):
+    # Falco posts here directly over the private security network.
+    # A shared token prevents the same route being abused through the web proxy.
+    if FALCO_WEBHOOK_SECRET and token != FALCO_WEBHOOK_SECRET:
+        raise HTTPException(401, "Invalid Falco webhook token")
     data = await request.json()
     severity = str(data.get("priority", "warning")).lower()
     if severity in {"emergency", "alert", "critical"}: severity = "critical"
@@ -491,9 +556,14 @@ async def check_update(name: str, authorization: str | None = Header(default=Non
 @app.get("/api/integrations")
 async def integrations(authorization: str | None = Header(default=None)):
     require_token(authorization)
-    result = {"clamav": {"configured": bool(CLAMAV_HOST)}, "crowdsec": {"configured": bool(CROWDSEC_URL)},
-              "wazuh": {"configured": bool(WAZUH_URL)}, "discord": {"configured": bool(DISCORD_WEBHOOK)},
-              "n8n": {"configured": bool(N8N_WEBHOOK)}, "falco": {"configured": True}, "trivy": {"configured": True}}
+    result = {
+        "clamav": {"configured": bool(CLAMAV_HOST)},
+        "crowdsec": {"configured": bool(CROWDSEC_URL)},
+        "falco": {"configured": True},
+        "trivy": {"configured": True},
+        "discord": {"configured": bool(DISCORD_WEBHOOK)},
+        "n8n": {"configured": bool(N8N_WEBHOOK)},
+    }
     try:
         reader, writer = await asyncio.wait_for(asyncio.open_connection(CLAMAV_HOST, CLAMAV_PORT), timeout=2)
         writer.write(b"PING\n"); await writer.drain()
@@ -509,16 +579,66 @@ async def integrations(authorization: str | None = Header(default=None)):
                 r = await client.get(CROWDSEC_URL.rstrip("/") + "/v1/decisions", headers=h)
                 result["crowdsec"]["status"] = "ok" if r.status_code < 500 else "down"
                 result["crowdsec"]["http"] = r.status_code
-        except Exception as e: result["crowdsec"]["status"] = "down"; result["crowdsec"]["detail"] = str(e)
-    if WAZUH_URL:
-        try:
-            async with httpx.AsyncClient(timeout=3, verify=False) as client:
-                h = {"Authorization": f"Bearer {WAZUH_TOKEN}"} if WAZUH_TOKEN else {}
-                r = await client.get(WAZUH_URL.rstrip("/") + "/", headers=h)
-                result["wazuh"]["status"] = "ok" if r.status_code < 500 else "down"
-                result["wazuh"]["http"] = r.status_code
-        except Exception as e: result["wazuh"]["status"] = "down"; result["wazuh"]["detail"] = str(e)
+        except Exception as e:
+            result["crowdsec"]["status"] = "down"; result["crowdsec"]["detail"] = str(e)
+
+    with conn() as c:
+        f = c.execute("SELECT ts,severity,container_name,message FROM security_events WHERE source='falco' ORDER BY id DESC LIMIT 1").fetchone()
+        counts = c.execute("SELECT severity,count(*) n FROM security_events WHERE source='falco' AND ts>? GROUP BY severity", (now()-86400,)).fetchall()
+    result["falco"]["events_24h"] = sum(r["n"] for r in counts)
+    result["falco"]["counts_24h"] = {r["severity"]: r["n"] for r in counts}
+    if f:
+        age = now() - int(f["ts"])
+        result["falco"]["last_event_ts"] = f["ts"]
+        result["falco"]["last_container"] = f["container_name"]
+        result["falco"]["last_severity"] = f["severity"]
+        result["falco"]["status"] = "ok" if age <= 300 else "stale"
+    else:
+        result["falco"]["status"] = "waiting"
+
+    # Trivy is considered OK only when the runner itself responds. Scan history is reported separately.
+    try:
+        code, version_out = await trivy_exec(["trivy", "--version"], timeout=30)
+        result["trivy"]["status"] = "ok" if code == 0 else "down"
+        result["trivy"]["detail"] = version_out.strip()[-500:]
+    except Exception as e:
+        result["trivy"]["status"] = "down"
+        result["trivy"]["detail"] = str(e)
+    with conn() as c:
+        t = c.execute("SELECT ts,container_name,image,status,critical,high,medium FROM scans ORDER BY id DESC LIMIT 1").fetchone()
+        tc = c.execute("SELECT count(*) n,coalesce(sum(critical),0) critical,coalesce(sum(high),0) high,coalesce(sum(medium),0) medium FROM scans WHERE ts>?", (now()-86400,)).fetchone()
+    result["trivy"]["scans_24h"] = tc["n"]
+    result["trivy"]["critical_24h"] = tc["critical"]
+    result["trivy"]["high_24h"] = tc["high"]
+    if t:
+        result["trivy"]["last_scan_ts"] = t["ts"]
+        result["trivy"]["last_container"] = t["container_name"]
+        result["trivy"]["last_scan_status"] = t["status"]
     return result
+
+
+@app.get("/api/security/falco/summary")
+async def falco_summary(authorization: str | None = Header(default=None)):
+    require_token(authorization)
+    with conn() as c:
+        rows = c.execute("SELECT id,ts,severity,container_name,message FROM security_events WHERE source='falco' ORDER BY id DESC LIMIT 20").fetchall()
+        counts = c.execute("SELECT severity,count(*) n FROM security_events WHERE source='falco' AND ts>? GROUP BY severity", (now()-86400,)).fetchall()
+    return {"events_24h": sum(r["n"] for r in counts), "counts_24h": {r["severity"]: r["n"] for r in counts}, "recent": rowdicts(rows)}
+
+
+@app.get("/api/security/trivy/summary")
+async def trivy_summary(authorization: str | None = Header(default=None)):
+    require_token(authorization)
+    start = now() - 86400
+    with conn() as c:
+        scans = c.execute("SELECT id,ts,container_name,image,status,critical,high,medium FROM scans ORDER BY id DESC LIMIT 20").fetchall()
+        counts = c.execute("SELECT count(*) n,coalesce(sum(critical),0) critical,coalesce(sum(high),0) high,coalesce(sum(medium),0) medium FROM scans WHERE ts>?", (start,)).fetchone()
+        findings = c.execute("""SELECT sf.scan_id,sf.container_name,sf.image,sf.vuln_id,sf.pkg_name,sf.installed_version,sf.fixed_version,sf.severity,sf.title
+                              FROM scan_findings sf JOIN scans s ON s.id=sf.scan_id
+                              WHERE s.ts>? AND sf.severity IN ('critical','high')
+                              ORDER BY CASE sf.severity WHEN 'critical' THEN 0 ELSE 1 END, sf.id DESC LIMIT 30""", (start,)).fetchall()
+    return {"scans_24h": counts["n"], "critical_24h": counts["critical"], "high_24h": counts["high"],
+            "medium_24h": counts["medium"], "recent_scans": rowdicts(scans), "top_findings": rowdicts(findings)}
 
 
 @app.get("/api/events")
@@ -627,7 +747,7 @@ DASHBOARD = r'''<!doctype html>
 <div class="grid">
 <div class="card"><div class="muted">Containers</div><div id="kTotal" class="kpi">—</div></div><div class="card"><div class="muted">Running</div><div id="kRunning" class="kpi good">—</div></div><div class="card"><div class="muted">Security / 24h</div><div id="kSecurity" class="kpi warn">—</div></div><div class="card"><div class="muted">Decisions / 24h</div><div id="kDecisions" class="kpi gold">—</div></div>
 <div class="card wide"><h2>🐳 Container Life</h2><div id="containers" class="scroll">Loading…</div></div>
-<div class="card side"><h2>🛡️ Security Engines</h2><div id="integrations">Loading…</div><h3>🧠 Decision Engine</h3><div class="muted">Critical events can isolate containers only when that container's policy explicitly enables Auto-Isolate.</div></div>
+<div class="card side"><h2>🛡️ Security Engines</h2><div id="integrations">Loading…</div><div id="falcoSummary"></div><div id="trivySummary"></div><h3>🧠 Decision Engine</h3><div class="muted">Critical events can isolate containers only when that container's policy explicitly enables Auto-Isolate.</div></div>
 <div class="card full"><h2>📜 Recent Kingdom Activity</h2><div id="events" class="scroll"></div></div>
 </div></div>
 <script>
@@ -638,14 +758,16 @@ function saveToken(){TOKEN=document.getElementById('token').value.trim();localSt
 function logout(){localStorage.removeItem('km_token');TOKEN='';document.getElementById('login').classList.remove('hidden')}
 function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 async function act(n,a){if((a==='stop'||a==='isolate')&&!confirm(`${a.toUpperCase()} ${n}?`))return;try{await api(`/api/containers/${encodeURIComponent(n)}/${a}`,{method:'POST'});await load()}catch(e){alert(e.message)}}
-async function scan(n){try{let d=await api(`/api/containers/${encodeURIComponent(n)}/trivy`,{method:'POST'});alert(`Trivy ${n}: Critical ${d.critical}, High ${d.high}, Medium ${d.medium}`);load()}catch(e){alert(e.message)}}
+async function scan(n){try{let d=await api(`/api/containers/${encodeURIComponent(n)}/trivy`,{method:'POST'});alert(`Trivy ${n}: Critical ${d.critical}, High ${d.high}, Medium ${d.medium}, Total ${d.total}`);load()}catch(e){alert(e.message)}}
 async function upd(n){try{let d=await api(`/api/containers/${encodeURIComponent(n)}/check-update`,{method:'POST'});alert(d.update_available?'New image pulled; container has NOT been recreated automatically.':'No image ID change detected.');load()}catch(e){alert(e.message)}}
 async function setFlag(n,k,v){try{await api(`/api/policies/${encodeURIComponent(n)}`,{method:'PUT',body:JSON.stringify({[k]:v})});load()}catch(e){alert(e.message)}}
 function policy(n,p){return `<div class="tiny">Policy: <label><input type="checkbox" ${p.auto_restart?'checked':''} onchange="setFlag('${esc(n)}','auto_restart',this.checked)"> recovery</label> · <label><input type="checkbox" ${p.auto_isolate?'checked':''} onchange="setFlag('${esc(n)}','auto_isolate',this.checked)"> auto-isolate</label> · <label><input type="checkbox" ${p.protected?'checked':''} onchange="setFlag('${esc(n)}','protected',this.checked)"> protected</label></div>`}
 async function load(){
  let o=await api('/api/overview');document.getElementById('kTotal').textContent=o.containers;document.getElementById('kRunning').textContent=o.running;document.getElementById('kSecurity').textContent=o.security_24h;document.getElementById('kDecisions').textContent=o.decisions_24h;document.getElementById('health').textContent='Kingdom Manager v'+o.version;
  let cs=await api('/api/containers');document.getElementById('containers').innerHTML=cs.map(c=>`<div class="row"><div><div class="name">${esc(c.name)} <span class="tag ${c.state==='running'?'good':'bad'}">${esc(c.state)}</span></div><div class="tiny">${esc(c.image)} · ${esc(c.status)}</div>${policy(c.name,c.policy)}</div><div class="toolbar"><button onclick="act('${esc(c.name)}','start')">Start</button><button onclick="act('${esc(c.name)}','restart')">Restart</button><button class="danger" onclick="act('${esc(c.name)}','stop')">Stop</button><button onclick="scan('${esc(c.name)}')">Trivy</button><button onclick="upd('${esc(c.name)}')">Update Check</button><button class="danger" onclick="act('${esc(c.name)}','isolate')">Isolate</button></div></div>`).join('');
- let ins=await api('/api/integrations');document.getElementById('integrations').innerHTML=Object.entries(ins).map(([k,v])=>`<div class="row"><span>${esc(k)}</span><span class="tag ${v.status==='ok'?'good':v.status==='down'?'bad':''}">${esc(v.status|| (v.configured?'ready':'not configured'))}</span></div>`).join('');
+ let ins=await api('/api/integrations');document.getElementById('integrations').innerHTML=Object.entries(ins).map(([k,v])=>`<div class="row"><span>${esc(k)}</span><span class="tag ${v.status==='ok'?'good':v.status==='down'?'bad':v.status==='stale'?'warn':''}">${esc(v.status|| (v.configured?'ready':'not configured'))}</span></div>`).join('');
+ let fs=await api('/api/security/falco/summary');let fc=fs.counts_24h||{};document.getElementById('falcoSummary').innerHTML=`<h3>🦅 Falco / 24h</h3><div class="tiny">Events: <b>${fs.events_24h||0}</b> · Critical: <b class="sev-critical">${fc.critical||0}</b> · High: <b class="sev-high">${fc.high||0}</b></div>`+(fs.recent||[]).slice(0,5).map(e=>`<div class="row"><div><b class="sev-${esc(e.severity)}">${esc(e.severity)}</b> · ${esc(e.container_name||'host')}<div class="tiny">${esc(e.message).slice(0,180)}</div></div></div>`).join('');
+ let ts=await api('/api/security/trivy/summary');document.getElementById('trivySummary').innerHTML=`<h3>🔎 Trivy / 24h</h3><div class="tiny">Scans: <b>${ts.scans_24h||0}</b> · Critical: <b class="sev-critical">${ts.critical_24h||0}</b> · High: <b class="sev-high">${ts.high_24h||0}</b> · Medium: <b>${ts.medium_24h||0}</b></div>`+(ts.top_findings||[]).slice(0,5).map(v=>`<div class="row"><div><b class="sev-${esc(v.severity)}">${esc(v.severity)}</b> · ${esc(v.container_name||'image')}<div class="tiny">${esc(v.vuln_id)} · ${esc(v.pkg_name)} ${esc(v.installed_version)}${v.fixed_version?' → '+esc(v.fixed_version):''}</div></div></div>`).join('');
  let ev=await api('/api/events?limit=80');document.getElementById('events').innerHTML=ev.map(e=>`<div class="row"><div><b class="sev-${esc(e.severity)}">${esc(e.kind)}</b> · ${esc(e.subject)}<div class="tiny">${new Date(e.ts*1000).toLocaleString()} · ${esc(e.detail)}</div></div></div>`).join('');
 }
 if(TOKEN){load().then(()=>document.getElementById('login').classList.add('hidden')).catch(()=>{})}
