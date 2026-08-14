@@ -3,7 +3,7 @@ services:
     build:
       context: ./app
       dockerfile: Dockerfile
-    image: kingdom-manager:1.3.0
+    image: kingdom-manager:1.4.0
     container_name: kingdom-manager
     restart: unless-stopped
     environment:
@@ -26,6 +26,11 @@ services:
       CROWDSEC_URL: "http://172.24.0.1:8080"
       CROWDSEC_API_KEY: "PASTE_YOUR_EXISTING_KINGDOM_MANAGER_BOUNCER_KEY_HERE"
       FALCO_WEBHOOK_SECRET: "kingdom-falco-2026-change-this"
+      FALCO_HOST: falco
+      FALCO_HEALTH_PORT: "8765"
+      TRIVY_AUTO_SCAN_ENABLED: "true"
+      TRIVY_AUTO_SCAN_EVERY_SECONDS: "3600"
+      TRIVY_RESCAN_SECONDS: "604800"
     volumes:
       - kingdom-manager-data:/data
     networks:
