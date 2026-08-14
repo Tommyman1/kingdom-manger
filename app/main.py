@@ -15,7 +15,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 app = FastAPI(title="Kingdom Manager", version=VERSION)
 
 DOCKER = os.getenv("DOCKER_HOST", "tcp://docker-socket-proxy:2375").replace("tcp://", "http://")
@@ -35,6 +35,9 @@ CLAMAV_PORT = int(os.getenv("CLAMAV_PORT", "3310"))
 CROWDSEC_URL = os.getenv("CROWDSEC_URL", "")
 CROWDSEC_API_KEY = os.getenv("CROWDSEC_API_KEY", "")
 FALCO_WEBHOOK_SECRET = os.getenv("FALCO_WEBHOOK_SECRET", "")
+DECISION_WINDOW_SECONDS = int(os.getenv("KM_DECISION_WINDOW_SECONDS", "900"))
+DECISION_DEBOUNCE_SECONDS = int(os.getenv("KM_DECISION_DEBOUNCE_SECONDS", "120"))
+TRIVY_CONTEXT_SECONDS = int(os.getenv("KM_TRIVY_CONTEXT_SECONDS", "604800"))
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -81,6 +84,16 @@ def init_db() -> None:
           container_name TEXT, decision TEXT NOT NULL, reason TEXT NOT NULL,
           executed INTEGER NOT NULL DEFAULT 0, result TEXT
         );
+        CREATE TABLE IF NOT EXISTS correlation_runs(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
+          container_name TEXT, score INTEGER NOT NULL, risk TEXT NOT NULL,
+          sources_json TEXT NOT NULL, signals_json TEXT NOT NULL,
+          action TEXT NOT NULL, executed INTEGER NOT NULL DEFAULT 0, result TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_security_events_subject_ts
+          ON security_events(container_name, ts);
+        CREATE INDEX IF NOT EXISTS idx_correlation_subject_ts
+          ON correlation_runs(container_name, ts);
         CREATE TABLE IF NOT EXISTS scans(
           id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
           container_name TEXT, image TEXT NOT NULL, status TEXT NOT NULL,
@@ -345,16 +358,15 @@ async def trivy_scan(name: str) -> dict:
 
     decision = None
     if status == "ok" and (counts["critical"] or counts["high"]):
-        # A vulnerable image is not the same thing as an active compromise. Do not isolate it.
-        # Feed a recommendation into the Decision Engine instead.
-        decision_name = "recommend_update" if counts["critical"] else "investigate_update"
-        reason = f"trivy: {counts['critical']} critical and {counts['high']} high vulnerabilities in {image}"
-        with conn() as c:
-            cur = c.execute("INSERT INTO decisions(ts,container_name,decision,reason,executed) VALUES(?,?,?,?,0)",
-                            (now(), name, decision_name, reason))
-            decision = {"id": cur.lastrowid, "decision": decision_name, "executed": False}
+        # Feed the scan into the same correlation engine used by runtime detections.
+        # Trivy is contextual exposure evidence and can never isolate by itself.
+        trigger_sev = "critical" if counts["critical"] else "high"
+        decision = await correlate_security(
+            name, "trivy", trigger_sev,
+            f"{counts['critical']} critical and {counts['high']} high vulnerabilities in {image}"
+        )
         if counts["critical"]:
-            await notify("Critical image vulnerabilities", f"{name} ({image}) has {counts['critical']} critical and {counts['high']} high findings. No automatic isolation was performed.", "critical")
+            await notify("Critical image vulnerabilities", f"{name} ({image}) has {counts['critical']} critical and {counts['high']} high findings. No isolation occurs from Trivy alone.", "critical")
 
     top = [f for f in findings if f["severity"] in {"critical", "high"}][:20]
     return {"scan_id": scan_id, "container": name, "image": image, "status": status, **counts,
@@ -375,34 +387,118 @@ async def pull_image(image: str) -> dict:
     return {"image": image, "before": before, "after": after, "update_available": bool(before and after and before != after)}
 
 
-async def decision_for_security(source: str, severity: str, name: str | None, message: str) -> dict:
-    sev = severity.lower()
-    decision = "record"
-    execute = False
-    reason = f"{source}: {message}"
-    if name:
-        p = default_policy(name)
-        if sev == "critical":
-            decision = "isolate" if p["auto_isolate"] and not p["protected"] else "recommend_isolation"
-            execute = decision == "isolate"
-        elif sev == "high":
-            decision = "investigate"
-        elif source.lower() == "clamav" and "infect" in message.lower():
-            decision = "isolate" if p["auto_isolate"] and not p["protected"] else "recommend_isolation"
-            execute = decision == "isolate"
+async def correlate_security(name: str | None, trigger_source: str, trigger_severity: str, trigger_message: str) -> dict:
+    """Correlate independent security engines before allowing an automated response.
+
+    Repeated events from one engine do not multiply risk. For each source we keep
+    only the strongest recent signal. Trivy is contextual vulnerability evidence,
+    not proof of compromise, so it can raise risk/recommend an update but cannot
+    by itself cause isolation.
+    """
+    subject = name or "host"
+    t = now()
+    severity_weight = {"critical": 45, "high": 25, "warning": 20, "medium": 12, "info": 5, "notice": 5, "low": 3}
+    source_bonus = {"clamav": 20, "falco": 0, "crowdsec": 10, "trivy": 0}
+    strongest: dict[str, dict] = {}
+
     with conn() as c:
-        cur = c.execute("INSERT INTO decisions(ts,container_name,decision,reason,executed) VALUES(?,?,?,?,?)",
-                        (now(), name, decision, reason, int(execute)))
-        did = cur.lastrowid
-    result = None
+        rows = c.execute(
+            "SELECT source,severity,message,ts FROM security_events WHERE coalesce(container_name,'host')=? AND ts>? ORDER BY ts DESC",
+            (subject, t - DECISION_WINDOW_SECONDS)
+        ).fetchall()
+        for r in rows:
+            src = str(r["source"]).lower()
+            sev = str(r["severity"]).lower()
+            weight = severity_weight.get(sev, 5) + source_bonus.get(src, 0)
+            old = strongest.get(src)
+            if old is None or weight > old["weight"]:
+                strongest[src] = {"source": src, "severity": sev, "message": r["message"], "ts": r["ts"], "weight": weight}
+
+        # Latest Trivy scan contributes exposure context for a container, but never counts as active compromise.
+        if name:
+            scan = c.execute(
+                "SELECT ts,critical,high,medium,image FROM scans WHERE container_name=? AND status='ok' AND ts>? ORDER BY id DESC LIMIT 1",
+                (name, t - TRIVY_CONTEXT_SECONDS)
+            ).fetchone()
+            if scan and (scan["critical"] or scan["high"]):
+                w = 25 if scan["critical"] else 12
+                strongest["trivy"] = {
+                    "source":"trivy", "severity":"critical" if scan["critical"] else "high",
+                    "message":f"{scan['critical']} critical / {scan['high']} high CVEs in {scan['image']}",
+                    "ts":scan["ts"], "weight":w
+                }
+
+    active_sources = {k:v for k,v in strongest.items() if k != "trivy"}
+    score = sum(v["weight"] for v in strongest.values())
+    source_count = len(active_sources)
+    malware = any(k == "clamav" and (v["severity"] in {"critical","high"} or "infect" in v["message"].lower() or "malware" in v["message"].lower()) for k,v in strongest.items())
+    falco_critical = strongest.get("falco", {}).get("severity") == "critical"
+    crowdsec_signal = "crowdsec" in active_sources
+    vulnerable = "trivy" in strongest
+
+    if score >= 90 and source_count >= 2:
+        risk, action = "critical", "recommend_isolation"
+    elif malware and source_count >= 2:
+        risk, action = "critical", "recommend_isolation"
+    elif score >= 60 or (falco_critical and vulnerable) or (falco_critical and crowdsec_signal):
+        risk, action = "high", "investigate"
+    elif malware:
+        risk, action = "high", "quarantine_evidence"
+    elif vulnerable and source_count == 0:
+        risk, action = "medium", "recommend_update"
+    elif score >= 30:
+        risk, action = "medium", "investigate"
+    else:
+        risk, action = "low", "record"
+
+    execute = False
+    result: Any = None
+    policy = default_policy(name) if name else None
+    if action == "recommend_isolation" and name and policy and policy["auto_isolate"] and not policy["protected"]:
+        action = "isolate"
+        execute = True
+
+    signals = list(strongest.values())
+    sources = sorted(strongest.keys())
+    reason = f"correlated risk={risk} score={score} sources={','.join(sources) or trigger_source}: {trigger_message}"
+
+    # Debounce identical decisions for the same subject. Events are still retained.
+    with conn() as c:
+        previous = c.execute(
+            "SELECT id,ts,action,score,risk FROM correlation_runs WHERE coalesce(container_name,'host')=? ORDER BY id DESC LIMIT 1",
+            (subject,)
+        ).fetchone()
+        if previous and previous["action"] == action and t - int(previous["ts"]) < DECISION_DEBOUNCE_SECONDS:
+            return {"id": previous["id"], "decision": action, "risk": risk, "score": score, "sources": sources, "executed": False, "debounced": True}
+
+        cur = c.execute(
+            "INSERT INTO correlation_runs(ts,container_name,score,risk,sources_json,signals_json,action,executed) VALUES(?,?,?,?,?,?,?,?)",
+            (t, name, score, risk, json.dumps(sources), json.dumps(signals, default=str), action, int(execute))
+        )
+        correlation_id = cur.lastrowid
+        dcur = c.execute("INSERT INTO decisions(ts,container_name,decision,reason,executed) VALUES(?,?,?,?,?)",
+                         (t, name, action, reason, int(execute)))
+        decision_id = dcur.lastrowid
+
     if execute and name:
         try:
             result = await isolate(name)
         except Exception as e:
             result = {"error": str(e)}
-    if sev in {"high", "critical"}:
-        await notify(f"Security {severity.upper()}: {source}", f"{name or 'host'} — {message}\nDecision: {decision}", sev)
-    return {"id": did, "decision": decision, "executed": execute, "result": result}
+            with conn() as c:
+                c.execute("UPDATE correlation_runs SET result=? WHERE id=?", (json.dumps(result), correlation_id))
+                c.execute("UPDATE decisions SET result=? WHERE id=?", (json.dumps(result), decision_id))
+    if risk in {"high", "critical"}:
+        await notify(
+            f"Kingdom {risk.upper()} risk",
+            f"{subject} — score {score} from {', '.join(sources)}\nDecision: {action}\nTrigger: {trigger_message}",
+            risk
+        )
+    return {"id": decision_id, "correlation_id": correlation_id, "decision": action, "risk": risk, "score": score, "sources": sources, "signals": signals, "executed": execute, "result": result}
+
+
+async def decision_for_security(source: str, severity: str, name: str | None, message: str) -> dict:
+    return await correlate_security(name, source.lower(), severity.lower(), message)
 
 
 @app.middleware("http")
@@ -641,6 +737,21 @@ async def trivy_summary(authorization: str | None = Header(default=None)):
             "medium_24h": counts["medium"], "recent_scans": rowdicts(scans), "top_findings": rowdicts(findings)}
 
 
+@app.get("/api/decision-engine/summary")
+async def decision_engine_summary(authorization: str | None = Header(default=None)):
+    require_token(authorization)
+    with conn() as c:
+        recent = c.execute("SELECT id,ts,container_name,score,risk,sources_json,action,executed,result FROM correlation_runs ORDER BY id DESC LIMIT 15").fetchall()
+        counts = c.execute("SELECT risk,count(*) n FROM correlation_runs WHERE ts>? GROUP BY risk", (now()-86400,)).fetchall()
+    items=[]
+    for r in recent:
+        d=dict(r)
+        try: d["sources"] = json.loads(d.pop("sources_json"))
+        except Exception: d["sources"] = []
+        items.append(d)
+    return {"window_seconds": DECISION_WINDOW_SECONDS, "counts_24h": {r["risk"]:r["n"] for r in counts}, "recent": items}
+
+
 @app.get("/api/events")
 async def events(limit: int = 100, authorization: str | None = Header(default=None)):
     require_token(authorization)
@@ -747,7 +858,7 @@ DASHBOARD = r'''<!doctype html>
 <div class="grid">
 <div class="card"><div class="muted">Containers</div><div id="kTotal" class="kpi">—</div></div><div class="card"><div class="muted">Running</div><div id="kRunning" class="kpi good">—</div></div><div class="card"><div class="muted">Security / 24h</div><div id="kSecurity" class="kpi warn">—</div></div><div class="card"><div class="muted">Decisions / 24h</div><div id="kDecisions" class="kpi gold">—</div></div>
 <div class="card wide"><h2>🐳 Container Life</h2><div id="containers" class="scroll">Loading…</div></div>
-<div class="card side"><h2>🛡️ Security Engines</h2><div id="integrations">Loading…</div><div id="falcoSummary"></div><div id="trivySummary"></div><h3>🧠 Decision Engine</h3><div class="muted">Critical events can isolate containers only when that container's policy explicitly enables Auto-Isolate.</div></div>
+<div class="card side"><h2>🛡️ Security Engines</h2><div id="integrations">Loading…</div><div id="falcoSummary"></div><div id="trivySummary"></div><h3>🧠 Decision Engine</h3><div class="muted">Correlates independent engines. Repeated alerts from one source do not multiply risk. Isolation requires strong multi-source evidence plus Auto-Isolate policy.</div><div id="decisionSummary"></div></div>
 <div class="card full"><h2>📜 Recent Kingdom Activity</h2><div id="events" class="scroll"></div></div>
 </div></div>
 <script>
@@ -768,6 +879,7 @@ async function load(){
  let ins=await api('/api/integrations');document.getElementById('integrations').innerHTML=Object.entries(ins).map(([k,v])=>`<div class="row"><span>${esc(k)}</span><span class="tag ${v.status==='ok'?'good':v.status==='down'?'bad':v.status==='stale'?'warn':''}">${esc(v.status|| (v.configured?'ready':'not configured'))}</span></div>`).join('');
  let fs=await api('/api/security/falco/summary');let fc=fs.counts_24h||{};document.getElementById('falcoSummary').innerHTML=`<h3>🦅 Falco / 24h</h3><div class="tiny">Events: <b>${fs.events_24h||0}</b> · Critical: <b class="sev-critical">${fc.critical||0}</b> · High: <b class="sev-high">${fc.high||0}</b></div>`+(fs.recent||[]).slice(0,5).map(e=>`<div class="row"><div><b class="sev-${esc(e.severity)}">${esc(e.severity)}</b> · ${esc(e.container_name||'host')}<div class="tiny">${esc(e.message).slice(0,180)}</div></div></div>`).join('');
  let ts=await api('/api/security/trivy/summary');document.getElementById('trivySummary').innerHTML=`<h3>🔎 Trivy / 24h</h3><div class="tiny">Scans: <b>${ts.scans_24h||0}</b> · Critical: <b class="sev-critical">${ts.critical_24h||0}</b> · High: <b class="sev-high">${ts.high_24h||0}</b> · Medium: <b>${ts.medium_24h||0}</b></div>`+(ts.top_findings||[]).slice(0,5).map(v=>`<div class="row"><div><b class="sev-${esc(v.severity)}">${esc(v.severity)}</b> · ${esc(v.container_name||'image')}<div class="tiny">${esc(v.vuln_id)} · ${esc(v.pkg_name)} ${esc(v.installed_version)}${v.fixed_version?' → '+esc(v.fixed_version):''}</div></div></div>`).join('');
+ let ds=await api('/api/decision-engine/summary');let dc=ds.counts_24h||{};document.getElementById('decisionSummary').innerHTML=`<div class="tiny">24h: Critical <b class="sev-critical">${dc.critical||0}</b> · High <b class="sev-high">${dc.high||0}</b> · Medium <b>${dc.medium||0}</b></div>`+(ds.recent||[]).slice(0,5).map(d=>`<div class="row"><div><b class="sev-${esc(d.risk)}">${esc(d.risk)}</b> · ${esc(d.container_name||'host')} · score ${d.score}<div class="tiny">${esc(d.action)} · ${esc((d.sources||[]).join(' + '))}</div></div></div>`).join('');
  let ev=await api('/api/events?limit=80');document.getElementById('events').innerHTML=ev.map(e=>`<div class="row"><div><b class="sev-${esc(e.severity)}">${esc(e.kind)}</b> · ${esc(e.subject)}<div class="tiny">${new Date(e.ts*1000).toLocaleString()} · ${esc(e.detail)}</div></div></div>`).join('');
 }
 if(TOKEN){load().then(()=>document.getElementById('login').classList.add('hidden')).catch(()=>{})}
