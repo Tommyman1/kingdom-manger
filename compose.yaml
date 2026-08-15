@@ -3,7 +3,7 @@ services:
     build:
       context: ./app
       dockerfile: Dockerfile
-    image: kingdom-manager:1.9.1
+    image: kingdom-manager:1.10.0
     container_name: kingdom-manager
     restart: unless-stopped
     environment:

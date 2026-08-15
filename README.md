@@ -1,4 +1,4 @@
-# 👑 Kingdom Manager v1.9.1
+# 👑 Kingdom Manager v1.9.0
 
 This release combines the planned **v1.6.2 trust/polish work** with **v1.7 reporting, history, and notifications**.
 
@@ -88,7 +88,7 @@ docker logs kingdom-manager --since 5m 2>&1 | \
   grep -iE 'migration|error|exception|traceback|trivy|report'
 ```
 
-The footer should show **v1.9.1**. Trivy may continue the scan already in progress or choose the next oldest/unscanned running container after restart.
+The footer should show **v1.9.0**. Trivy may continue the scan already in progress or choose the next oldest/unscanned running container after restart.
 
 
 ## v1.9 Intelligence + Controlled Recovery
@@ -122,11 +122,15 @@ This is **not autonomous self-healing by default**: recovery still requires an o
 ### Additional recovery guardrail
 Database containers are blocked from automated rebuild by default (`KM_RECOVERY_ALLOW_DATABASES=false`) even if Approved Rebuild is toggled. This is intentional because database recovery should be backup-aware.
 
-## v1.9.1 route and incident-scan fix
+## v1.10.0 Intelligence + Explainability + Noise Control
 
-- Removed the FastAPI route collision between generic container actions and dedicated endpoints such as `/trivy`.
-- Generic lifecycle operations now use `/api/containers/{name}/action/{action}`.
-- Isolation continues to use its dedicated `/api/containers/{name}/isolate` endpoint.
-- Incident `Scan Now` now uses a dedicated incident scan flow, refreshes the investigation after Trivy finishes, and keeps the incident drawer open with updated corroboration.
-- Added in-app Kingdom toast notifications for scan/action feedback instead of browser alerts in the repaired flows.
-- No database schema change from v1.9.0; existing `kingdom-manager-data` remains compatible.
+- Auditable confidence math for incident assessments, including deltas from the prior assessment.
+- Clear Falco scope: incident-matching events are shown separately from Kingdom-wide Falco totals.
+- Clean Trivy scans can strengthen a likely-expected assessment without erasing runtime anomalies.
+- Suppression impact preview before approval, exact container+rule scope, global suppression blocked by API, and optional expirations.
+- Kingdom Intelligence plain-language incident summary with suggested operator action.
+- Representative Falco process/executable/user/image/command samples remain grouped under each rule.
+- Baseline Learning analyzes recurring container+rule behavior over up to 7 days and only suggests known-good candidates; it never auto-applies suppressions.
+- Incident API supports status, severity, container, text query, and age filters.
+- Incident assessment history stores confidence and security-score snapshots for auditability.
+- Existing recovery controls remain approval-gated and protected/database safeguards remain unchanged.
