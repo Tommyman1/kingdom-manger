@@ -3,7 +3,7 @@ services:
     build:
       context: ./app
       dockerfile: Dockerfile
-    image: kingdom-manager:1.6.1
+    image: kingdom-manager:1.7.0
     container_name: kingdom-manager
     restart: unless-stopped
     environment:
@@ -34,6 +34,12 @@ services:
       TRIVY_AUTO_SCAN_EVERY_SECONDS: "1800"
       TRIVY_AUTO_SCAN_START_DELAY_SECONDS: "45"
       TRIVY_RESCAN_SECONDS: "604800"
+      KM_NOTIFY_MIN_SEVERITY: "high"
+      KM_DAILY_REPORT_ENABLED: "true"
+      KM_DAILY_REPORT_HOUR: "8"
+      KM_WEEKLY_REPORT_WEEKDAY: "0"
+      KM_WEEKLY_REPORT_HOUR: "9"
+      KM_SCORE_HISTORY_INTERVAL_SECONDS: "900"
     volumes:
       - kingdom-manager-data:/data
     networks:

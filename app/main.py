@@ -15,7 +15,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-VERSION = "1.6.1"
+VERSION = "1.7.0"
 app = FastAPI(title="Kingdom Manager", version=VERSION)
 
 DOCKER = os.getenv("DOCKER_HOST", "tcp://docker-socket-proxy:2375").replace("tcp://", "http://")
@@ -46,6 +46,13 @@ TRIVY_AUTO_SCAN_START_DELAY_SECONDS = int(os.getenv("TRIVY_AUTO_SCAN_START_DELAY
 TRIVY_RESCAN_SECONDS = int(os.getenv("TRIVY_RESCAN_SECONDS", "604800"))
 RECOVERY_DOCKER = os.getenv("RECOVERY_DOCKER_HOST", "tcp://recovery-socket-proxy:2375").replace("tcp://", "http://")
 RECOVERY_APPROVAL_TTL = int(os.getenv("KM_RECOVERY_APPROVAL_TTL_SECONDS", "900"))
+NOTIFY_MIN_SEVERITY = os.getenv("KM_NOTIFY_MIN_SEVERITY", "high").lower()
+DAILY_REPORT_ENABLED = os.getenv("KM_DAILY_REPORT_ENABLED", "true").lower() in {"1","true","yes","on"}
+DAILY_REPORT_HOUR = int(os.getenv("KM_DAILY_REPORT_HOUR", "8"))
+WEEKLY_REPORT_WEEKDAY = int(os.getenv("KM_WEEKLY_REPORT_WEEKDAY", "0"))
+WEEKLY_REPORT_HOUR = int(os.getenv("KM_WEEKLY_REPORT_HOUR", "9"))
+SCORE_HISTORY_INTERVAL_SECONDS = int(os.getenv("KM_SCORE_HISTORY_INTERVAL_SECONDS", "900"))
+SCHEMA_VERSION = 4
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -56,93 +63,89 @@ def conn() -> sqlite3.Connection:
     return c
 
 
+def _backup_database(label: str) -> str | None:
+    if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
+        return None
+    dest = DATA_DIR / f"kingdom.db.backup-{label}-{int(time.time())}"
+    src = sqlite3.connect(DB_PATH)
+    dst = sqlite3.connect(dest)
+    try:
+        src.backup(dst)
+    finally:
+        dst.close(); src.close()
+    return str(dest)
+
+
+def _ensure_column(c: sqlite3.Connection, table: str, name: str, decl: str) -> None:
+    cols = {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
+    if name not in cols:
+        c.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+
+def _migrate_events_if_needed() -> None:
+    with conn() as c:
+        exists = c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'").fetchone()
+        if not exists:
+            return
+        info = c.execute("PRAGMA table_info(events)").fetchall()
+        cols = {r[1] for r in info}
+        required = {"id","ts","kind","subject","detail","severity"}
+        legacy_required = [r[1] for r in info if r[1] not in required and int(r[3] or 0) == 1 and r[4] is None]
+        if required.issubset(cols) and not legacy_required:
+            return
+    backup = _backup_database(f"pre-schema-v{SCHEMA_VERSION}")
+    with conn() as c:
+        info = c.execute("PRAGMA table_info(events)").fetchall()
+        cols = {r[1] for r in info}
+        legacy = f"events_legacy_v{SCHEMA_VERSION}_{int(time.time())}"
+        c.execute(f"ALTER TABLE events RENAME TO {legacy}")
+        c.execute("""CREATE TABLE events(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
+          kind TEXT NOT NULL, subject TEXT, detail TEXT, severity TEXT DEFAULT 'info'
+        )""")
+        def col(name: str, fallback: str = "NULL") -> str:
+            return f'"{name}"' if name in cols else fallback
+        ts_expr = f"COALESCE({col('ts')}, CAST(strftime('%s',{col('created_at')}) AS INTEGER), CAST(strftime('%s','now') AS INTEGER))"
+        kind_expr = f"COALESCE(NULLIF({col('kind')},''),NULLIF({col('event_type')},''),NULLIF({col('source')},''),'legacy')"
+        subject_expr = f"COALESCE(NULLIF({col('subject')},''),NULLIF({col('container_name')},''),'host')"
+        detail_expr = f"COALESCE(NULLIF({col('detail')},''),NULLIF({col('message')},''),NULLIF({col('payload')},''),'')"
+        severity_expr = f"COALESCE(NULLIF({col('severity')},''),'info')"
+        c.execute(f"INSERT INTO events(id,ts,kind,subject,detail,severity) SELECT {col('id','NULL')},{ts_expr},{kind_expr},{subject_expr},{detail_expr},{severity_expr} FROM {legacy}")
+        c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('last_migration_backup',?)", (backup or '',))
+        c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('last_migration_legacy_table',?)", (legacy,))
+
+
 def init_db() -> None:
     with conn() as c:
         c.executescript("""
-        CREATE TABLE IF NOT EXISTS events(
-          id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
-          kind TEXT NOT NULL, subject TEXT, detail TEXT, severity TEXT DEFAULT 'info'
-        );
-        CREATE TABLE IF NOT EXISTS policies(
-          container_name TEXT PRIMARY KEY,
-          auto_restart INTEGER NOT NULL DEFAULT 1,
-          auto_update INTEGER NOT NULL DEFAULT 0,
-          auto_isolate INTEGER NOT NULL DEFAULT 0,
-          allow_rebuild INTEGER NOT NULL DEFAULT 0,
-          protected INTEGER NOT NULL DEFAULT 0,
-          idle_cpu REAL NOT NULL DEFAULT 3.0,
-          idle_minutes INTEGER NOT NULL DEFAULT 20
-        );
-        CREATE TABLE IF NOT EXISTS runtime_samples(
-          container_name TEXT PRIMARY KEY, ts INTEGER NOT NULL,
-          cpu REAL NOT NULL DEFAULT 0, rx INTEGER NOT NULL DEFAULT 0, tx INTEGER NOT NULL DEFAULT 0,
-          idle_since INTEGER
-        );
-        CREATE TABLE IF NOT EXISTS snapshots(
-          id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
-          container_name TEXT NOT NULL, reason TEXT NOT NULL, inspect_json TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS security_events(
-          id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
-          source TEXT NOT NULL, severity TEXT NOT NULL, container_name TEXT,
-          message TEXT NOT NULL, raw_json TEXT
-        );
-        CREATE TABLE IF NOT EXISTS decisions(
-          id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
-          container_name TEXT, decision TEXT NOT NULL, reason TEXT NOT NULL,
-          executed INTEGER NOT NULL DEFAULT 0, result TEXT
-        );
-        CREATE TABLE IF NOT EXISTS correlation_runs(
-          id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
-          container_name TEXT, score INTEGER NOT NULL, risk TEXT NOT NULL,
-          sources_json TEXT NOT NULL, signals_json TEXT NOT NULL,
-          action TEXT NOT NULL, executed INTEGER NOT NULL DEFAULT 0, result TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_security_events_subject_ts
-          ON security_events(container_name, ts);
-        CREATE INDEX IF NOT EXISTS idx_correlation_subject_ts
-          ON correlation_runs(container_name, ts);
-        CREATE TABLE IF NOT EXISTS scans(
-          id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,
-          container_name TEXT, image TEXT NOT NULL, status TEXT NOT NULL,
-          critical INTEGER DEFAULT 0, high INTEGER DEFAULT 0, medium INTEGER DEFAULT 0,
-          result_json TEXT
-        );
-        CREATE TABLE IF NOT EXISTS scan_findings(
-          id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id INTEGER NOT NULL,
-          container_name TEXT, image TEXT NOT NULL, target TEXT, vuln_id TEXT,
-          pkg_name TEXT, installed_version TEXT, fixed_version TEXT, severity TEXT, title TEXT,
-          FOREIGN KEY(scan_id) REFERENCES scans(id) ON DELETE CASCADE
-        );
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
-        CREATE TABLE IF NOT EXISTS risk_profiles(
-          container_name TEXT PRIMARY KEY, profile TEXT NOT NULL DEFAULT 'user-app', weight REAL NOT NULL DEFAULT 1.0
-        );
-        CREATE TABLE IF NOT EXISTS suppressions(
-          id INTEGER PRIMARY KEY AUTOINCREMENT, enabled INTEGER NOT NULL DEFAULT 1,
-          source TEXT NOT NULL, container_name TEXT, rule_contains TEXT, reason TEXT,
-          UNIQUE(source,container_name,rule_contains)
-        );
-        CREATE TABLE IF NOT EXISTS incidents(
-          id INTEGER PRIMARY KEY AUTOINCREMENT, created_ts INTEGER NOT NULL, updated_ts INTEGER NOT NULL,
-          container_name TEXT, severity TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open',
-          title TEXT NOT NULL, summary TEXT, score INTEGER NOT NULL DEFAULT 0,
-          sources_json TEXT NOT NULL DEFAULT '[]', correlation_id INTEGER, resolution TEXT
-        );
-        CREATE TABLE IF NOT EXISTS incident_evidence(
-          id INTEGER PRIMARY KEY AUTOINCREMENT, incident_id INTEGER NOT NULL, ts INTEGER NOT NULL,
-          evidence_type TEXT NOT NULL, label TEXT NOT NULL, payload TEXT NOT NULL,
-          FOREIGN KEY(incident_id) REFERENCES incidents(id) ON DELETE CASCADE
-        );
-        CREATE TABLE IF NOT EXISTS recovery_plans(
-          id INTEGER PRIMARY KEY AUTOINCREMENT, created_ts INTEGER NOT NULL, expires_ts INTEGER NOT NULL,
-          container_name TEXT NOT NULL, incident_id INTEGER, action TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
-          snapshot_id INTEGER, plan_json TEXT NOT NULL, approved_ts INTEGER, executed_ts INTEGER, result TEXT
-        );
-        CREATE TABLE IF NOT EXISTS maintenance(
-          container_name TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0, until_ts INTEGER, reason TEXT
-        );
+        CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, kind TEXT NOT NULL, subject TEXT, detail TEXT, severity TEXT DEFAULT 'info');
+        CREATE TABLE IF NOT EXISTS policies(container_name TEXT PRIMARY KEY,auto_restart INTEGER NOT NULL DEFAULT 1,auto_update INTEGER NOT NULL DEFAULT 0,auto_isolate INTEGER NOT NULL DEFAULT 0,allow_rebuild INTEGER NOT NULL DEFAULT 0,protected INTEGER NOT NULL DEFAULT 0,idle_cpu REAL NOT NULL DEFAULT 3.0,idle_minutes INTEGER NOT NULL DEFAULT 20);
+        CREATE TABLE IF NOT EXISTS runtime_samples(container_name TEXT PRIMARY KEY, ts INTEGER NOT NULL,cpu REAL NOT NULL DEFAULT 0, rx INTEGER NOT NULL DEFAULT 0, tx INTEGER NOT NULL DEFAULT 0,idle_since INTEGER);
+        CREATE TABLE IF NOT EXISTS snapshots(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,container_name TEXT NOT NULL, reason TEXT NOT NULL, inspect_json TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS security_events(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,source TEXT NOT NULL, severity TEXT NOT NULL, container_name TEXT,message TEXT NOT NULL, raw_json TEXT);
+        CREATE TABLE IF NOT EXISTS decisions(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,container_name TEXT, decision TEXT NOT NULL, reason TEXT NOT NULL,executed INTEGER NOT NULL DEFAULT 0, result TEXT);
+        CREATE TABLE IF NOT EXISTS correlation_runs(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,container_name TEXT, score INTEGER NOT NULL, risk TEXT NOT NULL,sources_json TEXT NOT NULL, signals_json TEXT NOT NULL,action TEXT NOT NULL, executed INTEGER NOT NULL DEFAULT 0, result TEXT);
+        CREATE TABLE IF NOT EXISTS scans(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL,container_name TEXT, image TEXT NOT NULL, status TEXT NOT NULL,critical INTEGER DEFAULT 0, high INTEGER DEFAULT 0, medium INTEGER DEFAULT 0,result_json TEXT);
+        CREATE TABLE IF NOT EXISTS scan_findings(id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id INTEGER NOT NULL,container_name TEXT, image TEXT NOT NULL, target TEXT, vuln_id TEXT,pkg_name TEXT, installed_version TEXT, fixed_version TEXT, severity TEXT, title TEXT,FOREIGN KEY(scan_id) REFERENCES scans(id) ON DELETE CASCADE);
+        CREATE TABLE IF NOT EXISTS risk_profiles(container_name TEXT PRIMARY KEY, profile TEXT NOT NULL DEFAULT 'user-app', weight REAL NOT NULL DEFAULT 1.0);
+        CREATE TABLE IF NOT EXISTS suppressions(id INTEGER PRIMARY KEY AUTOINCREMENT, enabled INTEGER NOT NULL DEFAULT 1,source TEXT NOT NULL, container_name TEXT, rule_contains TEXT, reason TEXT,UNIQUE(source,container_name,rule_contains));
+        CREATE TABLE IF NOT EXISTS incidents(id INTEGER PRIMARY KEY AUTOINCREMENT, created_ts INTEGER NOT NULL, updated_ts INTEGER NOT NULL,container_name TEXT, severity TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open',title TEXT NOT NULL, summary TEXT, score INTEGER NOT NULL DEFAULT 0,sources_json TEXT NOT NULL DEFAULT '[]', correlation_id INTEGER, resolution TEXT);
+        CREATE TABLE IF NOT EXISTS incident_evidence(id INTEGER PRIMARY KEY AUTOINCREMENT, incident_id INTEGER NOT NULL, ts INTEGER NOT NULL,evidence_type TEXT NOT NULL, label TEXT NOT NULL, payload TEXT NOT NULL,FOREIGN KEY(incident_id) REFERENCES incidents(id) ON DELETE CASCADE);
+        CREATE TABLE IF NOT EXISTS recovery_plans(id INTEGER PRIMARY KEY AUTOINCREMENT, created_ts INTEGER NOT NULL, expires_ts INTEGER NOT NULL,container_name TEXT NOT NULL, incident_id INTEGER, action TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',snapshot_id INTEGER, plan_json TEXT NOT NULL, approved_ts INTEGER, executed_ts INTEGER, result TEXT);
+        CREATE TABLE IF NOT EXISTS maintenance(container_name TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 0, until_ts INTEGER, reason TEXT);
+        CREATE TABLE IF NOT EXISTS score_history(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, score INTEGER NOT NULL,status TEXT NOT NULL, overall_risk TEXT NOT NULL, monitoring_confidence INTEGER NOT NULL,critical INTEGER NOT NULL DEFAULT 0, high INTEGER NOT NULL DEFAULT 0,medium INTEGER NOT NULL DEFAULT 0, low INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS notification_history(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, severity TEXT NOT NULL,title TEXT NOT NULL, body TEXT NOT NULL, discord_status TEXT, n8n_status TEXT);
+        CREATE TABLE IF NOT EXISTS report_history(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, report_type TEXT NOT NULL,payload TEXT NOT NULL, delivered_discord INTEGER NOT NULL DEFAULT 0, delivered_n8n INTEGER NOT NULL DEFAULT 0);
+        CREATE INDEX IF NOT EXISTS idx_security_events_subject_ts ON security_events(container_name, ts);
+        CREATE INDEX IF NOT EXISTS idx_correlation_subject_ts ON correlation_runs(container_name, ts);
+        CREATE INDEX IF NOT EXISTS idx_score_history_ts ON score_history(ts);
         """)
+    _migrate_events_if_needed()
+    with conn() as c:
+        for name, decl in {'auto_restart':'INTEGER NOT NULL DEFAULT 1','auto_update':'INTEGER NOT NULL DEFAULT 0','auto_isolate':'INTEGER NOT NULL DEFAULT 0','allow_rebuild':'INTEGER NOT NULL DEFAULT 0','protected':'INTEGER NOT NULL DEFAULT 0','idle_cpu':'REAL NOT NULL DEFAULT 3.0','idle_minutes':'INTEGER NOT NULL DEFAULT 20'}.items():
+            _ensure_column(c, 'policies', name, decl)
+        c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('schema_version',?)", (str(SCHEMA_VERSION),))
 
 
 init_db()
@@ -254,19 +257,28 @@ async def snapshot(name: str, reason: str) -> int:
     return sid
 
 
-async def notify(title: str, body: str, severity: str = "info") -> None:
-    payload = {"title": title, "body": body, "severity": severity, "ts": now()}
-    async with httpx.AsyncClient(timeout=10) as client:
-        if DISCORD_WEBHOOK:
-            try:
-                await client.post(DISCORD_WEBHOOK, json={"content": f"👑 **{title}**\n{body}"})
-            except Exception as e:
-                event("notify_error", "discord", str(e), "warning")
-        if N8N_WEBHOOK:
-            try:
-                await client.post(N8N_WEBHOOK, json=payload)
-            except Exception as e:
-                event("notify_error", "n8n", str(e), "warning")
+async def notify(title: str, body: str, severity: str = "info", force: bool = False) -> dict:
+    severity = severity.lower()
+    rank = {"info":0,"low":1,"notice":1,"warning":2,"medium":2,"high":3,"critical":4}
+    should_send = force or rank.get(severity,0) >= rank.get(NOTIFY_MIN_SEVERITY,3)
+    payload = {"title":title,"body":body,"severity":severity,"ts":now(),"version":VERSION}
+    discord_status = "not-configured" if not DISCORD_WEBHOOK else ("filtered" if not should_send else "pending")
+    n8n_status = "not-configured" if not N8N_WEBHOOK else ("filtered" if not should_send else "pending")
+    if should_send:
+        async with httpx.AsyncClient(timeout=10) as client:
+            if DISCORD_WEBHOOK:
+                try:
+                    r=await client.post(DISCORD_WEBHOOK,json={"content":f"👑 **{title}**\n{body}"}); discord_status=f"http-{r.status_code}"
+                except Exception as e:
+                    discord_status="error:"+str(e)[:180]; event("notify_error","discord",str(e),"warning")
+            if N8N_WEBHOOK:
+                try:
+                    r=await client.post(N8N_WEBHOOK,json=payload); n8n_status=f"http-{r.status_code}"
+                except Exception as e:
+                    n8n_status="error:"+str(e)[:180]; event("notify_error","n8n",str(e),"warning")
+    with conn() as c:
+        c.execute("INSERT INTO notification_history(ts,severity,title,body,discord_status,n8n_status) VALUES(?,?,?,?,?,?)",(now(),severity,title[:500],body[:10000],discord_status,n8n_status))
+    return {"discord":discord_status,"n8n":n8n_status,"sent":should_send}
 
 
 async def ensure_quarantine_network() -> None:
@@ -958,7 +970,7 @@ async def security_score(authorization: str | None = Header(default=None)):
     t=now(); cutoff=t-86400
     containers=await list_containers()
     with conn() as c:
-        corr=c.execute("SELECT container_name,score,risk,action,ts FROM correlation_runs WHERE ts>? ORDER BY ts DESC",(cutoff,)).fetchall()
+        corr=c.execute("SELECT container_name,score,risk,action,ts,sources_json,signals_json FROM correlation_runs WHERE ts>? ORDER BY ts DESC",(cutoff,)).fetchall()
         scans=c.execute("SELECT container_name,critical,high,medium,ts FROM scans WHERE status='ok' AND ts>? ORDER BY ts DESC",(t-TRIVY_CONTEXT_SECONDS,)).fetchall()
         falco=c.execute("SELECT container_name,severity,message,ts FROM security_events WHERE source='falco' AND ts>? ORDER BY ts DESC",(cutoff,)).fetchall()
         sup=c.execute("SELECT count(*) n FROM correlation_runs WHERE ts>? AND action='suppressed'",(cutoff,)).fetchone()['n']
@@ -977,7 +989,10 @@ async def security_score(authorization: str | None = Header(default=None)):
         if cr:
             raw=max(raw,min(100,int(cr['score'])))
             if cr['risk'] in severity_counts: severity_counts[cr['risk']]+=1
-            if cr['risk'] in ('critical','high'): factors.append('Decision Engine: '+cr['risk'])
+            if int(cr['score'] or 0) > 0:
+                try: srcs=', '.join(json.loads(cr['sources_json'] or '[]'))
+                except Exception: srcs='security evidence'
+                factors.append(f"Decision Engine: {cr['risk']} ({cr['score']} risk points; {srcs or 'single source'})")
         sc=latest_scan.get(name)
         if sc:
             vuln=min(35, int(sc['critical'])*12 + int(sc['high'])*4 + min(int(sc['medium']),10))
@@ -991,7 +1006,7 @@ async def security_score(authorization: str | None = Header(default=None)):
         elif score>=55: state='elevated'
         elif score>=35: state='high risk'
         else: state='critical'
-        row={'container':name,'score':score,'risk':weighted,'state':state,'profile':profile['profile'],'weight':profile['weight'],'factors':factors[:3] or ['No active correlated risk']}
+        row={'container':name,'score':score,'risk':weighted,'state':state,'profile':profile['profile'],'weight':profile['weight'],'factors':factors[:3] or ['No active risk deductions']}
         leaderboard.append(row)
         if score<55: immediate.append(row)
     leaderboard.sort(key=lambda x:(x['score'],x['container']))
@@ -1185,17 +1200,107 @@ async def security_events(limit: int = 100, authorization: str | None = Header(d
         return rowdicts(c.execute("SELECT id,ts,source,severity,container_name,message FROM security_events ORDER BY id DESC LIMIT ?", (max(1, min(limit, 500)),)).fetchall())
 
 
+def _safe_json(value: str | None, fallback=None):
+    try: return json.loads(value or "")
+    except Exception: return fallback
+
+
+@app.get("/api/activity")
+async def activity_feed(limit: int = 50, authorization: str | None = Header(default=None)):
+    require_token(authorization)
+    with conn() as c: rows=c.execute("SELECT id,ts,kind,subject,detail,severity FROM events ORDER BY id DESC LIMIT ?",(max(1,min(limit,200)),)).fetchall()
+    icon_map={'security':'🛡','security_event':'🛡','trivy':'🔎','trivy_auto_scan':'🔎','trivy_auto_complete':'✅','trivy_auto_error':'⚠️','idle':'💤','recovery':'♻️','recovery_failed':'🚨','evidence':'🧾','snapshot':'📸','maintenance':'🛠','suppression':'🔕','update_check':'⬆️','monitor_error':'⚠️','trivy_scheduler':'🔎','incident_status':'🚨'}
+    out=[]
+    for r in rows:
+        d=dict(r); detail=d.get('detail') or ''; parsed=_safe_json(detail)
+        if isinstance(parsed,dict):
+            if d['kind']=='idle': summary=f"Idle-ready · CPU {parsed.get('cpu','?')}%"
+            elif d['kind']=='trivy_auto_complete': summary=f"Scan complete · {parsed.get('critical',0)} critical · {parsed.get('high',0)} high"
+            elif d['kind']=='recovery': summary=str(parsed.get('action') or 'Recovery action completed')
+            else: summary=', '.join(f"{k}: {v}" for k,v in list(parsed.items())[:3])
+        else: summary=detail
+        out.append({**d,'icon':icon_map.get(d['kind'],'•'),'summary':str(summary)[:220]})
+    return out
+
+
+@app.get("/api/containers/{name}/security-profile")
+async def container_security_profile(name: str, authorization: str | None = Header(default=None)):
+    require_token(authorization); obj=await inspect_container(name); policy=default_policy(name); rp=risk_profile(name); ss=await security_score(authorization); riskrow=next((x for x in ss.get('leaderboard',[]) if x['container']==name),None)
+    with conn() as c:
+        sec=rowdicts(c.execute("SELECT id,ts,source,severity,message,raw_json FROM security_events WHERE container_name=? ORDER BY id DESC LIMIT 20",(name,)).fetchall()); scan=c.execute("SELECT id,ts,image,status,critical,high,medium FROM scans WHERE container_name=? ORDER BY id DESC LIMIT 1",(name,)).fetchone(); inc=rowdicts(c.execute("SELECT id,created_ts,updated_ts,severity,status,title,summary,score FROM incidents WHERE container_name=? ORDER BY id DESC LIMIT 10",(name,)).fetchall()); maint=c.execute("SELECT enabled,until_ts,reason FROM maintenance WHERE container_name=?",(name,)).fetchone()
+    for e in sec:
+        raw=_safe_json(e.pop('raw_json',None),{}) or {}; e['rule']=(raw.get('rule') or falco_rule_from_message(e.get('message',''))) if e.get('source')=='falco' else ''
+    mounts=[{'type':m.get('Type'),'source':m.get('Source'),'destination':m.get('Destination'),'rw':m.get('RW')} for m in (obj.get('Mounts') or [])]
+    return {'container':name,'image':obj.get('Config',{}).get('Image'),'image_id':obj.get('Image'),'state':obj.get('State',{}),'networks':list((obj.get('NetworkSettings',{}).get('Networks') or {}).keys()),'mounts':mounts,'policy':policy,'risk_profile':rp,'risk':riskrow,'recent_security_events':sec,'latest_scan':dict(scan) if scan else None,'incidents':inc,'maintenance':dict(maint) if maint else {'enabled':0}}
+
+
+@app.post("/api/incidents/{incident_id}/status")
+async def set_incident_status(incident_id: int, request: Request, authorization: str | None = Header(default=None)):
+    require_token(authorization); d=await request.json(); status=str(d.get('status','investigating')).lower()
+    if status not in {'open','investigating','isolated','resolved','dismissed'}: raise HTTPException(400,'Invalid incident status')
+    with conn() as c:
+        r=c.execute("SELECT container_name FROM incidents WHERE id=?",(incident_id,)).fetchone()
+        if not r: raise HTTPException(404,'Incident not found')
+        c.execute("UPDATE incidents SET status=?,updated_ts=? WHERE id=?",(status,now(),incident_id))
+    event('incident_status',r['container_name'] or 'host',{'incident_id':incident_id,'status':status}); return {'ok':True,'incident_id':incident_id,'status':status}
+
+
+@app.get("/api/security/history")
+async def security_history(hours: int = 168, authorization: str | None = Header(default=None)):
+    require_token(authorization); cutoff=now()-max(1,min(hours,24*90))*3600
+    with conn() as c: return rowdicts(c.execute("SELECT ts,score,status,overall_risk,monitoring_confidence,critical,high,medium,low FROM score_history WHERE ts>? ORDER BY ts",(cutoff,)).fetchall())
+
+
+@app.get("/api/recommendations")
+async def recommendations(authorization: str | None = Header(default=None)):
+    require_token(authorization); t=now(); ss=await security_score(authorization); cs=await list_containers(False); rec=[]
+    for sensor in ss.get('unavailable_sensors',[]): rec.append({'priority':'critical','title':f'{sensor.title()} sensor unavailable','detail':'Monitoring coverage is degraded. Diagnose the engine before trusting a clean score.','action':'diagnose'})
+    with conn() as c:
+        for item in cs:
+            name=item['name']
+            if name.startswith('kingdom-manager'): continue
+            scan=c.execute("SELECT ts,critical,high,status FROM scans WHERE container_name=? ORDER BY id DESC LIMIT 1",(name,)).fetchone()
+            if not scan: rec.append({'priority':'medium','title':f'Scan {name}','detail':'No Trivy result exists for this running container yet.','action':'scan','container':name})
+            elif scan['status']=='ok' and int(scan['critical'] or 0)>0: rec.append({'priority':'high','title':f'Critical CVEs in {name}','detail':f"{scan['critical']} critical and {scan['high']} high findings. Review fixes/update image.",'action':'review-cves','container':name})
+        noisy=c.execute("SELECT container_name,count(*) n FROM security_events WHERE source='falco' AND ts>? GROUP BY container_name HAVING n>=100 ORDER BY n DESC LIMIT 5",(t-86400,)).fetchall()
+        for n in noisy: rec.append({'priority':'low','title':f'Tune Falco noise for {n["container_name"] or "host"}','detail':f'{n["n"]} Falco events in 24h. Review known-good suppressions rather than ignoring globally.','action':'review-falco','container':n['container_name']})
+        opens=c.execute("SELECT id,container_name,severity,status,title FROM incidents WHERE status NOT IN ('resolved','dismissed') ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 ELSE 2 END,updated_ts DESC").fetchall()
+        for i in opens[:5]: rec.append({'priority':i['severity'],'title':f'Review incident #{i["id"]}','detail':i['title'],'action':'incident','incident_id':i['id'],'container':i['container_name']})
+    order={'critical':0,'high':1,'medium':2,'low':3,'info':4}; rec.sort(key=lambda x:order.get(x.get('priority','info'),4)); return rec[:20]
+
+
+async def build_report(days: int) -> dict:
+    start=now()-days*86400; cs=await list_containers(); ss=await security_score(f"Bearer {API_TOKEN}")
+    with conn() as c:
+        sec=c.execute("SELECT severity,count(*) n FROM security_events WHERE ts>? GROUP BY severity",(start,)).fetchall(); acts=c.execute("SELECT kind,count(*) n FROM events WHERE ts>? GROUP BY kind",(start,)).fetchall(); scans=c.execute("SELECT count(*) n,coalesce(sum(critical),0) critical,coalesce(sum(high),0) high,coalesce(sum(medium),0) medium FROM scans WHERE ts>?",(start,)).fetchone(); incidents=c.execute("SELECT severity,count(*) n FROM incidents WHERE created_ts>? GROUP BY severity",(start,)).fetchall(); resolved=c.execute("SELECT count(*) n FROM incidents WHERE updated_ts>? AND status='resolved'",(start,)).fetchone()['n']; hist=c.execute("SELECT score FROM score_history WHERE ts>? ORDER BY ts LIMIT 1",(start,)).fetchone()
+    return {'period_days':days,'generated_at':now(),'score':ss['score'],'score_change':ss['score']-(hist['score'] if hist else ss['score']),'monitoring_confidence':ss['monitoring_confidence'],'containers':{'total':len(cs),'running':sum(x['state']=='running' for x in cs)},'security':{r['severity']:r['n'] for r in sec},'activity':{r['kind']:r['n'] for r in acts},'trivy':dict(scans),'incidents':{r['severity']:r['n'] for r in incidents},'resolved_incidents':resolved,'recommendations':(await recommendations(f"Bearer {API_TOKEN}"))[:8]}
+
+
+@app.get("/api/reports/daily")
+async def daily_report(authorization: str | None = Header(default=None)):
+    require_token(authorization); return await build_report(1)
+
+
+@app.get("/api/reports/history")
+async def report_history(authorization: str | None = Header(default=None)):
+    require_token(authorization)
+    with conn() as c: return rowdicts(c.execute("SELECT id,ts,report_type,delivered_discord,delivered_n8n FROM report_history ORDER BY id DESC LIMIT 30").fetchall())
+
+
+@app.post("/api/reports/send/{kind}")
+async def send_report(kind: str, authorization: str | None = Header(default=None)):
+    require_token(authorization); days=1 if kind=='daily' else 7 if kind=='weekly' else 0
+    if not days: raise HTTPException(400,'kind must be daily or weekly')
+    report=await build_report(days); body=f"Security score: {report['score']}/100 ({report['score_change']:+d})\nContainers: {report['containers']['running']}/{report['containers']['total']} running\nTrivy: {report['trivy']['n']} scans, {report['trivy']['critical']} critical, {report['trivy']['high']} high\nIncidents: {sum(report['incidents'].values())} opened, {report['resolved_incidents']} resolved"
+    delivery=await notify(f"Kingdom {kind} security report",body,'info',force=True)
+    with conn() as c: c.execute("INSERT INTO report_history(ts,report_type,payload,delivered_discord,delivered_n8n) VALUES(?,?,?,?,?)",(now(),kind,json.dumps(report,default=str),int(str(delivery['discord']).startswith('http-2')),int(str(delivery['n8n']).startswith('http-2'))))
+    return {'ok':True,'report':report,'delivery':delivery}
+
+
 @app.get("/api/reports/weekly")
 async def weekly_report(authorization: str | None = Header(default=None)):
     require_token(authorization)
-    start = now() - 7 * 86400
-    cs = await list_containers()
-    with conn() as c:
-        sec = c.execute("SELECT severity,count(*) n FROM security_events WHERE ts>? GROUP BY severity", (start,)).fetchall()
-        acts = c.execute("SELECT kind,count(*) n FROM events WHERE ts>? GROUP BY kind", (start,)).fetchall()
-        scans = c.execute("SELECT count(*) n,coalesce(sum(critical),0) critical,coalesce(sum(high),0) high FROM scans WHERE ts>?", (start,)).fetchone()
-    return {"period_days": 7, "generated_at": now(), "containers": {"total": len(cs), "running": sum(x['state']=='running' for x in cs)},
-            "security": {r['severity']: r['n'] for r in sec}, "activity": {r['kind']: r['n'] for r in acts}, "trivy": dict(scans)}
+    return await build_report(7)
 
 
 async def monitor_loop():
@@ -1280,34 +1385,39 @@ async def trivy_auto_loop():
         await asyncio.sleep(max(300, TRIVY_AUTO_SCAN_EVERY_SECONDS))
 
 
-async def weekly_loop():
-    await asyncio.sleep(60)
+async def score_history_loop():
+    await asyncio.sleep(75)
     while True:
         try:
-            local = datetime.now(TZ)
-            weekkey = f"{local.isocalendar().year}-{local.isocalendar().week}"
+            ss=await security_score(f"Bearer {API_TOKEN}"); sc=ss.get('severity_counts') or {}
             with conn() as c:
-                sent = c.execute("SELECT value FROM settings WHERE key='weekly_sent'").fetchone()
-            if local.weekday() == 0 and local.hour >= 9 and (not sent or sent[0] != weekkey):
-                # Build a compact report without requiring auth internally.
-                start = now() - 7 * 86400
-                cs = await list_containers()
+                c.execute("INSERT INTO score_history(ts,score,status,overall_risk,monitoring_confidence,critical,high,medium,low) VALUES(?,?,?,?,?,?,?,?,?)",(now(),ss['score'],ss['status'],ss['overall_risk'],ss['monitoring_confidence'],sc.get('critical',0),sc.get('high',0),sc.get('medium',0),sc.get('low',0))); c.execute("DELETE FROM score_history WHERE ts<?",(now()-90*86400,))
+        except Exception as e: event('score_history_error','host',str(e),'warning')
+        await asyncio.sleep(max(300,SCORE_HISTORY_INTERVAL_SECONDS))
+
+
+async def reporting_loop():
+    await asyncio.sleep(90)
+    while True:
+        try:
+            local=datetime.now(TZ); daykey=local.strftime('%Y-%m-%d'); weekkey=f"{local.isocalendar().year}-{local.isocalendar().week}"
+            with conn() as c:
+                daily=c.execute("SELECT value FROM settings WHERE key='daily_sent'").fetchone(); weekly=c.execute("SELECT value FROM settings WHERE key='weekly_sent'").fetchone()
+            if DAILY_REPORT_ENABLED and local.hour>=DAILY_REPORT_HOUR and (not daily or daily[0]!=daykey):
+                report=await build_report(1); body=f"Score {report['score']}/100 ({report['score_change']:+d}) · {report['containers']['running']}/{report['containers']['total']} containers running · {sum(report['incidents'].values())} incidents · {report['trivy']['critical']} critical CVEs"; delivery=await notify('Kingdom daily security report',body,'info',force=True)
                 with conn() as c:
-                    secn = c.execute("SELECT count(*) FROM security_events WHERE ts>?", (start,)).fetchone()[0]
-                    decn = c.execute("SELECT count(*) FROM decisions WHERE ts>?", (start,)).fetchone()[0]
-                await notify("Kingdom weekly report", f"Containers: {sum(x['state']=='running' for x in cs)}/{len(cs)} running\nSecurity events: {secn}\nDecisions: {decn}")
+                    c.execute("INSERT INTO report_history(ts,report_type,payload,delivered_discord,delivered_n8n) VALUES(?,?,?,?,?)",(now(),'daily',json.dumps(report,default=str),int(str(delivery['discord']).startswith('http-2')),int(str(delivery['n8n']).startswith('http-2')))); c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('daily_sent',?)",(daykey,))
+            if local.weekday()==WEEKLY_REPORT_WEEKDAY and local.hour>=WEEKLY_REPORT_HOUR and (not weekly or weekly[0]!=weekkey):
+                report=await build_report(7); body=f"Score {report['score']}/100 ({report['score_change']:+d}) · {report['containers']['running']}/{report['containers']['total']} containers running · {sum(report['incidents'].values())} incidents · {report['trivy']['critical']} critical CVEs"; delivery=await notify('Kingdom weekly security report',body,'info',force=True)
                 with conn() as c:
-                    c.execute("INSERT INTO settings(key,value) VALUES('weekly_sent',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (weekkey,))
-        except Exception as e:
-            event("weekly_error", "report", str(e), "warning")
-        await asyncio.sleep(3600)
+                    c.execute("INSERT INTO report_history(ts,report_type,payload,delivered_discord,delivered_n8n) VALUES(?,?,?,?,?)",(now(),'weekly',json.dumps(report,default=str),int(str(delivery['discord']).startswith('http-2')),int(str(delivery['n8n']).startswith('http-2')))); c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('weekly_sent',?)",(weekkey,))
+        except Exception as e: event('reporting_error','report',str(e),'warning')
+        await asyncio.sleep(1800)
 
 
 @app.on_event("startup")
 async def startup():
-    asyncio.create_task(monitor_loop())
-    asyncio.create_task(trivy_auto_loop())
-    asyncio.create_task(weekly_loop())
+    asyncio.create_task(monitor_loop()); asyncio.create_task(trivy_auto_loop()); asyncio.create_task(score_history_loop()); asyncio.create_task(reporting_loop())
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1317,15 +1427,24 @@ async def dashboard():
 
 DASHBOARD = r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Kingdom Manager</title>
 <style>
-:root{--bg:#050b12;--panel:#09131d;--line:#1c3040;--text:#eef5fa;--muted:#8fa3b5;--gold:#d8a844;--green:#4ee07d;--lime:#92e65c;--amber:#ffb02e;--red:#ff5f57;--blue:#32b7ff}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 50% -20%,#10283b 0,#07111b 30%,var(--bg) 68%);color:var(--text);font:14px Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif;min-height:100vh}.wrap{max-width:1500px;margin:auto;padding:26px}.top{display:flex;align-items:center;justify-content:space-between;gap:18px}.brand{display:flex;align-items:center;gap:14px}.crest{width:54px;height:62px;border:2px solid var(--gold);clip-path:polygon(50% 0,96% 16%,88% 72%,50% 100%,12% 72%,4% 16%);display:grid;place-items:center;color:var(--gold);font-size:28px;background:#0b1620}.brand h1{font-size:25px;letter-spacing:.04em;margin:0}.muted,.tiny{color:var(--muted)}.tiny{font-size:12px}.system{display:flex;align-items:center;gap:12px}.okdot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 12px var(--green)}button,input{background:#0b1722;color:var(--text);border:1px solid #294153;border-radius:9px;padding:8px 11px}button{cursor:pointer}.hero{margin-top:22px;border:1px solid var(--line);border-radius:14px;background:linear-gradient(115deg,#08131d,#07111a 60%,#0a1721);padding:22px;display:grid;grid-template-columns:1.2fr .75fr .72fr;gap:24px;box-shadow:0 22px 70px #0007}.scorebox{display:flex;align-items:center;gap:28px}.ring{--score:82;--mood:#4ee07d;width:180px;height:180px;border-radius:50%;background:conic-gradient(var(--mood) calc(var(--score)*1%),#18303a 0);padding:10px;filter:drop-shadow(0 0 18px #4ee07d44)}.ringin{width:100%;height:100%;border-radius:50%;background:#07111a;display:grid;place-items:center;text-align:center;border:1px solid #213745}.score{font-size:58px;font-weight:800;line-height:.9}.status{font-size:34px;font-weight:800;letter-spacing:.03em}.facewrap{display:grid;place-items:center}.facehalo{width:205px;height:205px;border-radius:50%;border:2px solid var(--gold);display:grid;place-items:center;box-shadow:0 0 0 9px #d8a8440b,0 0 38px #d8a84420}.face{width:154px;height:154px;border-radius:50%;background:radial-gradient(circle at 36% 28%,#a8ffc1 0,#5edb7a 36%,#2a9449 75%,#12612d 100%);box-shadow:inset -14px -18px 30px #002b1880,inset 10px 10px 25px #ffffff22,0 0 35px #48db7040;position:relative;transition:.4s}.eye{position:absolute;top:52px;width:17px;height:24px;border-radius:50%;background:#06120d}.eye.l{left:42px}.eye.r{right:42px}.mouth{position:absolute;left:50%;top:92px;width:62px;height:30px;transform:translateX(-50%);border-bottom:6px solid #06120d;border-radius:0 0 60px 60px;transition:.4s}.face.excellent{background:radial-gradient(circle at 36% 28%,#a8ffc1 0,#5ee58a 36%,#289c50 75%,#12612d 100%)}.face.good{background:radial-gradient(circle at 36% 28%,#d5ff9d 0,#92e65c 38%,#559d34 76%,#275d20 100%)}.face.elevated{background:radial-gradient(circle at 36% 28%,#fff1a8 0,#ffd24d 40%,#b4771d 76%,#6d4213 100%)}.face.elevated .mouth{height:5px;border-radius:0;top:105px}.face.high .mouth,.face.critical .mouth{border-bottom:0;border-top:6px solid #06120d;border-radius:60px 60px 0 0;top:106px}.face.high{background:radial-gradient(circle at 36% 28%,#ffe09b,#ffad3f 45%,#a84420 100%)}.face.critical{background:radial-gradient(circle at 36% 28%,#ffb3a9,#ff6158 45%,#8b1f27 100%)}.severity{border-left:1px solid var(--line);padding-left:22px}.sevrow{display:flex;justify-content:space-between;padding:14px 4px;border-bottom:1px solid #152b39;font-weight:700}.attention{border:1px solid #274050;border-radius:12px;padding:18px;background:#08141e}.attention-ok{text-align:center;padding:18px 4px;color:var(--green)}.check{font-size:40px}.engines{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-top:14px}.card{background:linear-gradient(145deg,#09141e,#07111a);border:1px solid var(--line);border-radius:13px;padding:18px;box-shadow:0 12px 35px #0004}.engine-head{display:flex;justify-content:space-between;align-items:center;font-weight:800;font-size:16px}.tag{font-size:11px;border:1px solid #294153;border-radius:999px;padding:4px 8px}.good{color:var(--green)}.bad{color:var(--red)}.warn{color:var(--amber)}.engine-kpi{font-size:28px;margin-top:18px}.spark{height:24px;margin-top:12px;border-bottom:1px solid #183042;background:linear-gradient(175deg,transparent 55%,#32b7ff 56%,transparent 59%)}.lower{display:grid;grid-template-columns:1.35fr .95fr;gap:14px;margin-top:14px}.table{width:100%;border-collapse:collapse}.table th{text-align:left;color:var(--muted);font-size:11px;padding:10px;border-bottom:1px solid var(--line)}.table td{padding:11px 10px;border-bottom:1px solid #142634}.state{font-weight:700}.activity{max-height:360px;overflow:auto}.event{padding:11px;border-bottom:1px solid #142634;display:flex;justify-content:space-between;gap:12px}.event strong{display:block}.footer{display:flex;justify-content:space-between;gap:12px;margin:18px 0;color:var(--muted);font-size:12px;border-top:1px solid var(--line);padding-top:14px}.containers{margin-top:14px}.container-row{display:flex;justify-content:space-between;gap:12px;padding:12px 4px;border-bottom:1px solid #142634}.toolbar{display:flex;gap:6px;flex-wrap:wrap}.policybar{display:flex;gap:7px;flex-wrap:wrap;margin-top:8px}.policybtn{font-size:11px;padding:5px 8px;border-radius:999px}.policybtn.on{border-color:#3b8d59;color:var(--green);background:#0b2117}.policybtn.off{color:var(--muted)}.policybtn.protected.on{border-color:#d8a844;color:var(--gold);background:#201806}.danger{border-color:#69323a}.login{position:fixed;inset:0;background:#04090ef2;display:flex;align-items:center;justify-content:center;z-index:10}.loginbox{width:min(440px,92vw);background:#09141e;border:1px solid #294153;border-radius:16px;padding:26px}.loginbox input{width:100%;margin:12px 0}.hidden{display:none!important}.section-title{font-size:16px;letter-spacing:.03em;margin:0 0 12px}.sev-critical{color:var(--red)}.sev-high{color:var(--amber)}.sev-medium{color:#ffd95a}.sev-low{color:var(--green)}@media(max-width:1050px){.hero{grid-template-columns:1fr}.severity{border-left:0;padding-left:0}.engines{grid-template-columns:repeat(2,1fr)}.lower{grid-template-columns:1fr}}@media(max-width:650px){.wrap{padding:14px}.scorebox{flex-direction:column;align-items:flex-start}.engines{grid-template-columns:1fr}.system{display:none}}
+:root{--bg:#050b12;--panel:#09131d;--line:#1c3040;--text:#eef5fa;--muted:#8fa3b5;--gold:#d8a844;--green:#4ee07d;--lime:#92e65c;--amber:#ffb02e;--red:#ff5f57;--blue:#32b7ff}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 50% -20%,#10283b 0,#07111b 30%,var(--bg) 68%);color:var(--text);font:14px Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif;min-height:100vh}.wrap{max-width:1560px;margin:auto;padding:26px}.top{display:flex;align-items:center;justify-content:space-between;gap:18px}.brand{display:flex;align-items:center;gap:14px}.crest{width:54px;height:62px;border:2px solid var(--gold);clip-path:polygon(50% 0,96% 16%,88% 72%,50% 100%,12% 72%,4% 16%);display:grid;place-items:center;color:var(--gold);font-size:28px;background:#0b1620}.brand h1{font-size:25px;letter-spacing:.04em;margin:0}.muted,.tiny{color:var(--muted)}.tiny{font-size:12px}.system{display:flex;align-items:center;gap:12px}.okdot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 12px var(--green)}button,input,select{background:#0b1722;color:var(--text);border:1px solid #294153;border-radius:9px;padding:8px 11px}button{cursor:pointer}.hero{margin-top:22px;border:1px solid var(--line);border-radius:14px;background:linear-gradient(115deg,#08131d,#07111a 60%,#0a1721);padding:22px;display:grid;grid-template-columns:1.2fr .75fr .72fr;gap:24px;box-shadow:0 22px 70px #0007}.scorebox{display:flex;align-items:center;gap:28px}.ring{--score:82;--mood:#4ee07d;width:180px;height:180px;border-radius:50%;background:conic-gradient(var(--mood) calc(var(--score)*1%),#18303a 0);padding:10px}.ringin{width:100%;height:100%;border-radius:50%;background:#07111a;display:grid;place-items:center;text-align:center;border:1px solid #213745}.score{font-size:58px;font-weight:800;line-height:.9}.status{font-size:34px;font-weight:800}.facewrap{display:grid;place-items:center}.facehalo{width:205px;height:205px;border-radius:50%;border:2px solid var(--gold);display:grid;place-items:center}.face{width:154px;height:154px;border-radius:50%;position:relative;transition:.35s;background:radial-gradient(circle at 36% 28%,#a8ffc1,#5ee58a 36%,#289c50 75%,#12612d)}.eye{position:absolute;top:52px;width:17px;height:24px;border-radius:50%;background:#06120d}.eye.l{left:42px}.eye.r{right:42px}.mouth{position:absolute;left:50%;top:92px;width:62px;height:30px;transform:translateX(-50%);border-bottom:6px solid #06120d;border-radius:0 0 60px 60px}.face.good{background:radial-gradient(circle at 36% 28%,#d5ff9d,#92e65c 38%,#559d34 76%,#275d20)}.face.elevated{background:radial-gradient(circle at 36% 28%,#fff1a8,#ffd24d 40%,#b4771d 76%,#6d4213)}.face.elevated .mouth{height:5px;border-radius:0;top:105px}.face.high,.face.critical{background:radial-gradient(circle at 36% 28%,#ffe09b,#ffad3f 45%,#a84420)}.face.critical{background:radial-gradient(circle at 36% 28%,#ffb3a9,#ff6158 45%,#8b1f27)}.face.high .mouth,.face.critical .mouth{border-bottom:0;border-top:6px solid #06120d;border-radius:60px 60px 0 0;top:106px}.severity{border-left:1px solid var(--line);padding-left:22px}.sevrow{display:flex;justify-content:space-between;padding:14px 4px;border-bottom:1px solid #152b39;font-weight:700}.attention{border:1px solid #274050;border-radius:12px;padding:18px;background:#08141e}.attention-ok{text-align:center;padding:18px 4px;color:var(--green)}.check{font-size:40px}.engines{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-top:14px}.card{background:linear-gradient(145deg,#09141e,#07111a);border:1px solid var(--line);border-radius:13px;padding:18px}.engine-head{display:flex;justify-content:space-between;align-items:center;font-weight:800;font-size:16px}.tag{font-size:11px;border:1px solid #294153;border-radius:999px;padding:4px 8px}.good{color:var(--green)}.bad{color:var(--red)}.warn{color:var(--amber)}.engine-kpi{font-size:28px;margin-top:18px}.spark{height:24px;margin-top:12px;border-bottom:1px solid #183042;background:linear-gradient(175deg,transparent 55%,#32b7ff 56%,transparent 59%)}.grid2{display:grid;grid-template-columns:1.15fr .85fr;gap:14px;margin-top:14px}.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;margin-top:14px}.table{width:100%;border-collapse:collapse}.table th{text-align:left;color:var(--muted);font-size:11px;padding:10px;border-bottom:1px solid var(--line)}.table td{padding:11px 10px;border-bottom:1px solid #142634}.table tr.clickable{cursor:pointer}.table tr.clickable:hover{background:#0d1c28}.state{font-weight:700}.activity{max-height:390px;overflow:auto}.event{padding:11px;border-bottom:1px solid #142634;display:flex;justify-content:space-between;gap:12px}.event strong{display:block}.event-actions{display:flex;gap:5px;flex-wrap:wrap;margin-top:6px}.event-actions button{font-size:11px;padding:5px 7px}.footer{display:flex;justify-content:space-between;gap:12px;margin:18px 0;color:var(--muted);font-size:12px;border-top:1px solid var(--line);padding-top:14px}.containers{margin-top:14px}.container-row{display:flex;justify-content:space-between;gap:12px;padding:12px 4px;border-bottom:1px solid #142634}.toolbar,.policybar{display:flex;gap:6px;flex-wrap:wrap}.policybar{margin-top:8px}.policybtn{font-size:11px;padding:5px 8px;border-radius:999px}.policybtn.on{border-color:#3b8d59;color:var(--green);background:#0b2117}.policybtn.off{color:var(--muted)}.policybtn.protected.on{border-color:#d8a844;color:var(--gold);background:#201806}.danger{border-color:#69323a}.login{position:fixed;inset:0;background:#04090ef2;display:flex;align-items:center;justify-content:center;z-index:30}.loginbox{width:min(440px,92vw);background:#09141e;border:1px solid #294153;border-radius:16px;padding:26px}.loginbox input{width:100%;margin:12px 0}.hidden{display:none!important}.section-title{font-size:16px;letter-spacing:.03em;margin:0 0 12px}.sev-critical{color:var(--red)}.sev-high{color:var(--amber)}.sev-medium{color:#ffd95a}.sev-low{color:var(--green)}.recommend{border-left:3px solid var(--blue);padding-left:10px}.recommend.high,.recommend.critical{border-left-color:var(--red)}.recommend.medium{border-left-color:var(--amber)}.chart{width:100%;height:110px}.drawer{position:fixed;inset:0 0 0 auto;width:min(620px,96vw);background:#07111a;border-left:1px solid #294153;z-index:25;box-shadow:-25px 0 80px #000b;padding:22px;overflow:auto}.drawer-head{display:flex;justify-content:space-between;align-items:center;position:sticky;top:-22px;background:#07111a;padding:18px 0;z-index:2}.drawer section{border-top:1px solid var(--line);padding:14px 0}.kv{display:grid;grid-template-columns:150px 1fr;gap:8px;padding:5px 0}@media(max-width:1050px){.hero{grid-template-columns:1fr}.severity{border-left:0;padding-left:0}.engines{grid-template-columns:repeat(2,1fr)}.grid2,.grid3{grid-template-columns:1fr}}@media(max-width:650px){.wrap{padding:14px}.scorebox{flex-direction:column;align-items:flex-start}.engines{grid-template-columns:1fr}.system{display:none}}
 </style></head><body>
 <div id="login" class="login"><div class="loginbox"><div class="brand"><div class="crest">♛</div><div><h1>ENTER THE KINGDOM</h1><div class="muted">Kingdom Manager secure console</div></div></div><input id="token" type="password" placeholder="Kingdom Manager token"><button onclick="saveToken()">Unlock Dashboard</button><p id="loginerr" class="bad"></p></div></div>
-<div class="wrap"><div class="top"><div class="brand"><div class="crest">♛</div><div><h1>KINGDOM MANAGER</h1><div class="muted">Security Overview · Decision Engine · Container Life</div></div></div><div class="system"><span class="okdot"></span><div><b id="systemState" class="good">Checking systems</b><div id="lastCheck" class="tiny">—</div></div><button onclick="logout()">Lock</button></div></div>
-<section class="hero"><div><h2 class="section-title">KINGDOM SECURITY SCORE</h2><div class="scorebox"><div id="scoreRing" class="ring"><div class="ringin"><div><div id="score" class="score">—</div><div class="muted">/100</div></div></div></div><div><div id="scoreStatus" class="status">CHECKING</div><h3>Overall Risk: <span id="overallRisk">—</span></h3><p id="scoreText" class="muted">Evaluating independent security engines and container risk.</p><div class="tiny"><span id="suppressed">0</span> known-good signals suppressed in 24h</div></div></div></div><div class="facewrap"><div class="facehalo"><div id="moodFace" class="face"><span class="eye l"></span><span class="eye r"></span><span class="mouth"></span></div></div><div class="tiny" style="margin-top:12px">KINGDOM SENTINEL</div></div><div class="severity"><div class="sevrow sev-critical"><span>⬡ CRITICAL</span><span id="sevCritical">0</span></div><div class="sevrow sev-high"><span>⬡ HIGH</span><span id="sevHigh">0</span></div><div class="sevrow sev-medium"><span>⬡ MEDIUM</span><span id="sevMedium">0</span></div><div class="sevrow sev-low"><span>⬡ LOW</span><span id="sevLow">0</span></div><div id="attention" class="attention" style="margin-top:16px"><h3>IMMEDIATE ATTENTION</h3><div class="attention-ok"><div class="check">✓</div>No incidents require immediate attention.</div></div></div></section>
-<div id="engines" class="engines"></div><div class="lower"><div class="card"><h2 class="section-title">🚨 INCIDENT CENTER</h2><div id="incidents" class="activity"></div></div><div class="card"><h2 class="section-title">🧠 EXPLAIN MY SCORE</h2><div id="scoreExplain" class="activity"></div></div></div><div class="lower"><div class="card"><h2 class="section-title">CONTAINER RISK LEADERBOARD</h2><table class="table"><thead><tr><th>CONTAINER</th><th>SCORE</th><th>STATE</th><th>PROFILE</th><th>TOP RISK FACTOR</th></tr></thead><tbody id="leaderboard"></tbody></table></div><div class="card"><h2 class="section-title">RECENT KINGDOM ACTIVITY</h2><div id="activity" class="activity"></div></div></div><div class="card containers"><h2 class="section-title">CONTAINER LIFE & CONTROLS</h2><div id="containers"></div></div><div class="footer"><span>🧠 Decision Engine <b class="good">Active</b></span><span>🛡 Independent-source correlation</span><span id="footerEval">Last evaluation —</span><span>v1.6.1 · UI Recovery Policies + Incident Response ♛</span></div></div>
+<div id="drawer" class="drawer hidden"><div class="drawer-head"><div><h2 id="drawerTitle">Container</h2><div id="drawerSubtitle" class="muted"></div></div><button onclick="closeDrawer()">Close</button></div><div id="drawerBody"></div></div>
+<div class="wrap"><div class="top"><div class="brand"><div class="crest">♛</div><div><h1>KINGDOM MANAGER</h1><div class="muted">Security Overview · Incident Response · Reports · Container Life</div></div></div><div class="system"><span class="okdot"></span><div><b id="systemState" class="good">Checking systems</b><div id="lastCheck" class="tiny">—</div></div><button onclick="logout()">Lock</button></div></div>
+<section class="hero"><div><h2 class="section-title">KINGDOM SECURITY SCORE</h2><div class="scorebox"><div id="scoreRing" class="ring"><div class="ringin"><div><div id="score" class="score">—</div><div class="muted">/100</div></div></div></div><div><div id="scoreStatus" class="status">CHECKING</div><h3>Overall Risk: <span id="overallRisk">—</span></h3><p id="scoreText" class="muted">Evaluating independent security engines and container risk.</p><div class="tiny"><span id="suppressed">0</span> known-good signals suppressed in 24h · Monitoring confidence <span id="confidence">—</span>%</div></div></div></div><div class="facewrap"><div class="facehalo"><div id="moodFace" class="face"><span class="eye l"></span><span class="eye r"></span><span class="mouth"></span></div></div><div class="tiny" style="margin-top:12px">KINGDOM SENTINEL</div></div><div class="severity"><div class="sevrow sev-critical"><span>⬡ CRITICAL</span><span id="sevCritical">0</span></div><div class="sevrow sev-high"><span>⬡ HIGH</span><span id="sevHigh">0</span></div><div class="sevrow sev-medium"><span>⬡ MEDIUM</span><span id="sevMedium">0</span></div><div class="sevrow sev-low"><span>⬡ LOW</span><span id="sevLow">0</span></div><div id="attention" class="attention" style="margin-top:16px"></div></div></section>
+<div id="engines" class="engines"></div>
+<div class="grid2"><div class="card"><h2 class="section-title">🚨 INCIDENT CENTER</h2><div id="incidents" class="activity"></div></div><div class="card"><h2 class="section-title">🧠 EXPLAIN MY SCORE</h2><div id="scoreExplain" class="activity"></div></div></div>
+<div class="grid2"><div class="card"><h2 class="section-title">CONTAINER RISK LEADERBOARD</h2><table class="table"><thead><tr><th>CONTAINER</th><th>SCORE</th><th>STATE</th><th>PROFILE</th><th>TOP RISK FACTOR</th></tr></thead><tbody id="leaderboard"></tbody></table></div><div class="card"><h2 class="section-title">RECENT KINGDOM ACTIVITY</h2><div id="activity" class="activity"></div></div></div>
+<div class="grid3"><div class="card"><h2 class="section-title">📈 SCORE HISTORY · 7 DAYS</h2><svg id="historyChart" class="chart" viewBox="0 0 500 110" preserveAspectRatio="none"></svg><div id="historyMeta" class="tiny"></div></div><div class="card"><h2 class="section-title">💡 SECURITY RECOMMENDATIONS</h2><div id="recommendations" class="activity"></div></div><div class="card"><h2 class="section-title">📋 REPORTING & NOTIFICATIONS</h2><div id="reporting"></div><div class="toolbar" style="margin-top:12px"><button onclick="sendReport('daily')">Send Daily</button><button onclick="sendReport('weekly')">Send Weekly</button></div></div></div>
+<div class="card containers"><h2 class="section-title">CONTAINER LIFE & CONTROLS</h2><div id="containers"></div></div><div class="footer"><span>🧠 Decision Engine <b class="good">Active</b></span><span>🛡 Versioned DB migrations</span><span id="footerEval">Last evaluation —</span><span>v1.7.0 · Incident Intelligence + Reporting ♛</span></div></div>
 <script>
-let TOKEN=localStorage.getItem('km_token')||'';function hdr(){return {'Authorization':'Bearer '+TOKEN,'Content-Type':'application/json'}}async function api(url,opt={}){opt.headers={...(opt.headers||{}),...hdr()};let r=await fetch(url,opt);if(r.status===401){document.getElementById('login').classList.remove('hidden');throw Error('Unauthorized')}let t=await r.text(),d=t?JSON.parse(t):{};if(!r.ok)throw Error(d.detail||t);return d}function saveToken(){TOKEN=document.getElementById('token').value.trim();localStorage.setItem('km_token',TOKEN);load().then(()=>document.getElementById('login').classList.add('hidden')).catch(e=>document.getElementById('loginerr').textContent=e.message)}function logout(){localStorage.removeItem('km_token');TOKEN='';document.getElementById('login').classList.remove('hidden')}function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}function age(sec){if(sec==null)return'never';if(sec<60)return sec+'s ago';if(sec<3600)return Math.floor(sec/60)+'m ago';return Math.floor(sec/3600)+'h ago'}async function act(n,a){if((a==='stop'||a==='isolate')&&!confirm(`${a.toUpperCase()} ${n}?`))return;try{await api(`/api/containers/${encodeURIComponent(n)}/${a}`,{method:'POST'});load()}catch(e){alert(e.message)}}async function scan(n){try{let d=await api(`/api/containers/${encodeURIComponent(n)}/trivy`,{method:'POST'});alert(`Trivy ${n}: Critical ${d.critical}, High ${d.high}, Medium ${d.medium}`);load()}catch(e){alert(e.message)}}async function upd(n){try{let d=await api(`/api/containers/${encodeURIComponent(n)}/check-update`,{method:'POST'});alert(d.update_available?'New image pulled; container was not recreated automatically.':'No image ID change detected.');load()}catch(e){alert(e.message)}}async function policy(n,key,value){try{await api(`/api/policies/${encodeURIComponent(n)}`,{method:'PUT',body:JSON.stringify({[key]:value})});load()}catch(e){alert(e.message)}}function policyButton(n,label,key,on,extra=''){return `<button class="policybtn ${on?'on':'off'} ${extra}" onclick="policy('${esc(n)}','${key}',${on?'false':'true'})">${on?'✓':'○'} ${label}</button>`}function engineCard(name,icon,status,body){return `<div class="card"><div class="engine-head"><span>${icon} ${name.toUpperCase()}</span><span class="tag ${status==='ok'?'good':status==='down'?'bad':'warn'}">${esc(status||'ready').toUpperCase()}</span></div>${body}<div class="spark"></div></div>`}
-async function load(){let [ins,fs,ts,ss,ev,cs,incs,explain]=await Promise.all([api('/api/integrations'),api('/api/security/falco/summary'),api('/api/security/trivy/summary'),api('/api/security/score'),api('/api/events?limit=35'),api('/api/containers'),api('/api/incidents'),api('/api/security/explain-score')]);document.getElementById('incidents').innerHTML=incs.length?incs.slice(0,8).map(i=>`<div class="event"><div><strong class="${i.severity==='critical'?'bad':i.severity==='high'?'warn':''}">#${i.id} ${esc(i.container_name||'host')} · ${esc(i.severity).toUpperCase()}</strong><span class="tiny">${esc(i.title)} · ${esc((i.sources||[]).join(', '))}</span></div><span class="tag warn">${esc(i.status)}</span></div>`).join(''):'<div class="attention-ok">✓ No active incidents.</div>';document.getElementById('scoreExplain').innerHTML=(explain.contributors||[]).length?(explain.contributors||[]).slice(0,8).map(x=>`<div class="event"><div><strong>${esc(x.subject)}</strong><span class="tiny">${esc(x.detail)}</span></div><b>−${x.points_lost}</b></div>`).join(''):'<div class="attention-ok">✓ No active deductions.</div>';let healthy=Object.values(ins).filter(x=>x.configured).every(x=>x.status==='ok');document.getElementById('systemState').textContent=healthy?'All Systems Operational':'Review Security Engines';document.getElementById('systemState').className=healthy?'good':'warn';document.getElementById('lastCheck').textContent='Last check: just now';let ring=document.getElementById('scoreRing'),color=ss.score>=90?'#4ee07d':ss.score>=75?'#92e65c':ss.score>=55?'#ffd24d':ss.score>=35?'#ff9f35':'#ff5f57';ring.style.setProperty('--score',ss.score);ring.style.setProperty('--mood',color);document.getElementById('score').textContent=ss.score;let st=document.getElementById('scoreStatus');st.textContent=ss.status;st.style.color=color;document.getElementById('overallRisk').textContent=ss.overall_risk;document.getElementById('scoreText').textContent=(ss.unavailable_sensors||[]).length?`Monitoring degraded: ${(ss.unavailable_sensors||[]).join(', ')} unavailable. Risk score includes a sensor-confidence penalty.`:ss.score>=90?'Your Kingdom is secure. No significant correlated threats are active.':ss.score>=75?'Your Kingdom is stable. A few signals deserve observation.':ss.score>=55?'Elevated activity detected. Review the risk leaderboard.':ss.score>=35?'High-risk evidence needs investigation.':'Critical correlated risk requires immediate attention.';document.getElementById('suppressed').textContent=ss.suppressed_24h||0;document.getElementById('moodFace').className='face '+ss.mood;let halo=document.querySelector('.facehalo');halo.style.borderColor=color;halo.style.boxShadow=`0 0 0 9px ${color}12,0 0 42px ${color}35`;let sc=ss.severity_counts||{};['Critical','High','Medium','Low'].forEach(k=>document.getElementById('sev'+k).textContent=sc[k.toLowerCase()]||0);let att=ss.immediate_attention||[];document.getElementById('attention').innerHTML='<h3>IMMEDIATE ATTENTION</h3>'+(att.length?att.map(x=>`<div class="event"><div><strong class="${x.score<35?'sev-critical':'sev-high'}">${esc(x.container)} · ${esc(x.state)}</strong><span class="tiny">${esc(x.factors[0])}</span></div><b>${x.score}</b></div>`).join(''):'<div class="attention-ok"><div class="check">✓</div>No incidents require immediate attention.</div>');let fc=fs.counts_24h||{};document.getElementById('engines').innerHTML=engineCard('Falco','🦅',ins.falco.status,`<div class="engine-kpi">${fs.events_24h||0}</div><div class="tiny">Events (24h) · <span class="sev-critical">${fc.critical||0} critical</span> · <span class="sev-high">${fc.high||0} high</span><br>Last event ${age(fs.last_event_age_seconds)}</div>`)+engineCard('Trivy','◇',ins.trivy.status,`<div class="engine-kpi">${ts.scans_24h||0}</div><div class="tiny">Scans (24h) · <span class="sev-critical">${ts.critical_24h||0} critical</span> · <span class="sev-high">${ts.high_24h||0} high</span><br>Scheduler: ${esc((ts.scheduler||{}).state|| (ts.auto_scan_enabled?'starting':'disabled'))}${(ts.scheduler||{}).last_error?'<br><span class="bad">'+esc((ts.scheduler||{}).last_error).slice(0,110)+'</span>':''}</div>`)+engineCard('ClamAV','⬡',ins.clamav.status,`<div class="engine-kpi">${ins.clamav.status==='ok'?'Clean':'Review'}</div><div class="tiny">Malware scanning sensor</div>`)+engineCard('CrowdSec','♜',ins.crowdsec.status,`<div class="engine-kpi">${ins.crowdsec.status==='ok'?'Active':'Review'}</div><div class="tiny">Host intrusion decisions & firewall context</div>`);document.getElementById('leaderboard').innerHTML=(ss.leaderboard||[]).map(x=>`<tr><td><b>${esc(x.container)}</b></td><td><b>${x.score}</b></td><td class="state ${x.score>=75?'good':x.score>=55?'warn':'bad'}">${esc(x.state).toUpperCase()}</td><td>${esc(x.profile)}</td><td class="tiny">${esc(x.factors[0])}</td></tr>`).join('');document.getElementById('activity').innerHTML=ev.map(e=>`<div class="event"><div><strong>${esc(e.subject||e.kind)}</strong><span class="tiny">${esc(e.detail).slice(0,150)}</span></div><span class="tiny">${new Date(e.ts*1000).toLocaleTimeString()}</span></div>`).join('');document.getElementById('containers').innerHTML=cs.map(c=>{let p=c.policy||{};return `<div class="container-row"><div style="min-width:0"><b>${esc(c.name)}</b> <span class="tag ${c.state==='running'?'good':'bad'}">${esc(c.state)}</span><div class="tiny">${esc(c.image)} · ${esc(c.status)}</div><div class="policybar">${policyButton(c.name,'Approved Rebuild','allow_rebuild',!!p.allow_rebuild)}${policyButton(c.name,'Auto-Isolate','auto_isolate',!!p.auto_isolate)}${policyButton(c.name,'Auto-Restart','auto_restart',!!p.auto_restart)}${policyButton(c.name,'Protected','protected',!!p.protected,'protected')}</div></div><div class="toolbar"><button onclick="act('${esc(c.name)}','start')">Start</button><button onclick="act('${esc(c.name)}','restart')">Restart</button><button class="danger" onclick="act('${esc(c.name)}','stop')">Stop</button><button onclick="scan('${esc(c.name)}')">Trivy</button><button onclick="upd('${esc(c.name)}')">Update</button><button class="danger" onclick="act('${esc(c.name)}','isolate')">Isolate</button></div></div>`}).join('');document.getElementById('footerEval').textContent='Last full evaluation '+new Date(ss.evaluated_ts*1000).toLocaleTimeString()}
+let TOKEN=localStorage.getItem('km_token')||'';function hdr(){return {'Authorization':'Bearer '+TOKEN,'Content-Type':'application/json'}}async function api(url,opt={}){opt.headers={...(opt.headers||{}),...hdr()};let r=await fetch(url,opt);if(r.status===401){document.getElementById('login').classList.remove('hidden');throw Error('Unauthorized')}let t=await r.text(),d=t?JSON.parse(t):{};if(!r.ok)throw Error(d.detail||t);return d}function saveToken(){TOKEN=document.getElementById('token').value.trim();localStorage.setItem('km_token',TOKEN);load().then(()=>document.getElementById('login').classList.add('hidden')).catch(e=>document.getElementById('loginerr').textContent=e.message)}function logout(){localStorage.removeItem('km_token');TOKEN='';document.getElementById('login').classList.remove('hidden')}function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}function age(sec){if(sec==null)return'never';if(sec<60)return sec+'s ago';if(sec<3600)return Math.floor(sec/60)+'m ago';return Math.floor(sec/3600)+'h ago'}async function act(n,a){if((a==='stop'||a==='isolate')&&!confirm(`${a.toUpperCase()} ${n}?`))return;try{await api(`/api/containers/${encodeURIComponent(n)}/${a}`,{method:'POST'});load()}catch(e){alert(e.message)}}async function scan(n){try{let d=await api(`/api/containers/${encodeURIComponent(n)}/trivy`,{method:'POST'});alert(`Trivy ${n}: Critical ${d.critical}, High ${d.high}, Medium ${d.medium}`);load();if(!document.getElementById('drawer').classList.contains('hidden'))openDrawer(n)}catch(e){alert(e.message)}}async function upd(n){try{let d=await api(`/api/containers/${encodeURIComponent(n)}/check-update`,{method:'POST'});alert(d.update_available?'New image pulled; container was not recreated automatically.':'No image ID change detected.');load()}catch(e){alert(e.message)}}async function policy(n,key,value){try{await api(`/api/policies/${encodeURIComponent(n)}`,{method:'PUT',body:JSON.stringify({[key]:value})});load();if(!document.getElementById('drawer').classList.contains('hidden'))openDrawer(n)}catch(e){alert(e.message)}}function policyButton(n,label,key,on,extra=''){return `<button class="policybtn ${on?'on':'off'} ${extra}" onclick="event.stopPropagation();policy('${esc(n)}','${key}',${on?'false':'true'})">${on?'✓':'○'} ${label}</button>`}function engineCard(name,icon,status,body){let cls=status==='ok'?'good':status==='down'||status==='error'?'bad':'warn';return `<div class="card"><div class="engine-head"><span>${icon} ${name.toUpperCase()}</span><span class="tag ${cls}">${esc(status||'ready').toUpperCase()}</span></div>${body}<div class="spark"></div></div>`}
+async function incidentStatus(id,status){await api(`/api/incidents/${id}/status`,{method:'POST',body:JSON.stringify({status})});load()}async function evidence(id){let d=await api(`/api/incidents/${id}/capture-evidence`,{method:'POST'});alert('Evidence captured: '+(d.captured||[]).join(', '));load()}async function resolveIncident(id){let r=prompt('Resolution note','Resolved by operator');if(r===null)return;await api(`/api/incidents/${id}/resolve`,{method:'POST',body:JSON.stringify({resolution:r})});load()}async function sendReport(k){let d=await api(`/api/reports/send/${k}`,{method:'POST'});alert(`${k} report processed. Discord: ${d.delivery.discord}; n8n: ${d.delivery.n8n}`);load()}
+function closeDrawer(){document.getElementById('drawer').classList.add('hidden')}async function suppressFalco(n,rule){let reason=prompt('Why is this expected?','Known-good behavior for this container');if(!reason)return;await api('/api/suppressions',{method:'POST',body:JSON.stringify({source:'falco',container_name:n,rule_contains:rule,reason})});alert('Suppression added for '+rule);openDrawer(n)}async function maintenance(n,on){await api(`/api/maintenance/${encodeURIComponent(n)}`,{method:'PUT',body:JSON.stringify({enabled:on,minutes:60,reason:'Operator maintenance'})});openDrawer(n);load()}
+async function openDrawer(n){let d=await api(`/api/containers/${encodeURIComponent(n)}/security-profile`);document.getElementById('drawerTitle').textContent=n;document.getElementById('drawerSubtitle').textContent=(d.image||'')+' · '+(d.risk?.state||'unknown');let p=d.policy||{},r=d.risk||{},sc=d.latest_scan,m=d.maintenance||{};let sec=(d.recent_security_events||[]).slice(0,8).map(e=>`<div class="event"><div><strong class="${e.severity==='critical'?'bad':e.severity==='high'?'warn':''}">${esc(e.source)} · ${esc(e.severity)}</strong><span class="tiny">${esc(e.rule||e.message).slice(0,130)}</span>${e.source==='falco'&&e.rule?`<div class="event-actions"><button onclick="suppressFalco('${esc(n)}','${esc(e.rule)}')">Mark Expected</button></div>`:''}</div><span class="tiny">${new Date(e.ts*1000).toLocaleTimeString()}</span></div>`).join('')||'<div class="tiny">No recent security events.</div>';document.getElementById('drawerBody').innerHTML=`<section><div class="kv"><b>Security score</b><span>${r.score??100}/100 · ${esc(r.state||'healthy')}</span></div><div class="kv"><b>Profile</b><span>${esc(d.risk_profile?.profile)} ×${d.risk_profile?.weight}</span></div><div class="kv"><b>Networks</b><span>${esc((d.networks||[]).join(', '))}</span></div><div class="kv"><b>Top factors</b><span>${esc((r.factors||[]).join(' · '))}</span></div></section><section><h3>Recovery & Response Policy</h3><div class="policybar">${policyButton(n,'Approved Rebuild','allow_rebuild',!!p.allow_rebuild)}${policyButton(n,'Auto-Isolate','auto_isolate',!!p.auto_isolate)}${policyButton(n,'Auto-Restart','auto_restart',!!p.auto_restart)}${policyButton(n,'Protected','protected',!!p.protected,'protected')}</div><div class="toolbar" style="margin-top:10px"><button onclick="scan('${esc(n)}')">Scan Now</button><button onclick="act('${esc(n)}','restart')">Restart</button><button class="danger" onclick="act('${esc(n)}','isolate')">Isolate</button><button onclick="maintenance('${esc(n)}',${m.enabled?'false':'true'})">${m.enabled?'End Maintenance':'Maintenance 1h'}</button></div></section><section><h3>Latest Trivy</h3>${sc?`<div class="kv"><b>Result</b><span>${sc.status} · ${sc.critical} critical · ${sc.high} high · ${sc.medium} medium</span></div><div class="kv"><b>Age</b><span>${age(Math.max(0,Math.floor(Date.now()/1000)-sc.ts))}</span></div>`:'<div class="tiny">Not scanned yet.</div>'}</section><section><h3>Recent Security Evidence</h3>${sec}</section><section><h3>Mounts</h3><div class="tiny">${esc((d.mounts||[]).map(x=>`${x.destination} (${x.type}${x.rw?', rw':', ro'})`).join(' · ')||'None')}</div></section>`;document.getElementById('drawer').classList.remove('hidden')}
+function drawHistory(rows){let svg=document.getElementById('historyChart');if(!rows.length){svg.innerHTML='<text x="10" y="55" fill="#8fa3b5">History begins after this upgrade.</text>';document.getElementById('historyMeta').textContent='';return}let w=500,h=110,min=Math.min(...rows.map(x=>x.score)),max=Math.max(...rows.map(x=>x.score));let pts=rows.map((x,i)=>`${(i/(Math.max(1,rows.length-1))*w).toFixed(1)},${(h-10-(x.score/100)*(h-20)).toFixed(1)}`).join(' ');svg.innerHTML=`<polyline fill="none" stroke="#32b7ff" stroke-width="3" points="${pts}"/><line x1="0" y1="${h-10-0.75*(h-20)}" x2="500" y2="${h-10-0.75*(h-20)}" stroke="#294153" stroke-dasharray="4 4"/>`;document.getElementById('historyMeta').textContent=`${rows[0].score} → ${rows[rows.length-1].score} · range ${min}–${max}`}
+async function load(){let [ins,fs,ts,ss,ev,cs,incs,explain,hist,recs,reph]=await Promise.all([api('/api/integrations'),api('/api/security/falco/summary'),api('/api/security/trivy/summary'),api('/api/security/score'),api('/api/activity?limit=35'),api('/api/containers'),api('/api/incidents'),api('/api/security/explain-score'),api('/api/security/history?hours=168'),api('/api/recommendations'),api('/api/reports/history')]);let healthy=['clamav','crowdsec','falco','trivy'].every(k=>ins[k]?.status==='ok');document.getElementById('systemState').textContent=healthy?'All Systems Operational':'Review Security Engines';document.getElementById('systemState').className=healthy?'good':'warn';document.getElementById('lastCheck').textContent='Last check: just now';let color=ss.score>=90?'#4ee07d':ss.score>=75?'#92e65c':ss.score>=55?'#ffd24d':ss.score>=35?'#ff9f35':'#ff5f57',ring=document.getElementById('scoreRing');ring.style.setProperty('--score',ss.score);ring.style.setProperty('--mood',color);document.getElementById('score').textContent=ss.score;document.getElementById('scoreStatus').textContent=ss.status;document.getElementById('scoreStatus').style.color=color;document.getElementById('overallRisk').textContent=ss.overall_risk;document.getElementById('confidence').textContent=ss.monitoring_confidence;document.getElementById('scoreText').textContent=(ss.unavailable_sensors||[]).length?`Monitoring degraded: ${(ss.unavailable_sensors||[]).join(', ')} unavailable.`:ss.score>=90?'Your Kingdom is secure. No significant correlated threats are active.':ss.score>=75?'Your Kingdom is stable. A few signals deserve observation.':ss.score>=55?'Elevated activity detected. Review the risk leaderboard.':ss.score>=35?'High-risk evidence needs investigation.':'Critical correlated risk requires immediate attention.';document.getElementById('suppressed').textContent=ss.suppressed_24h||0;document.getElementById('moodFace').className='face '+ss.mood;let halo=document.querySelector('.facehalo');halo.style.borderColor=color;halo.style.boxShadow=`0 0 0 9px ${color}12,0 0 42px ${color}35`;let sc=ss.severity_counts||{};['Critical','High','Medium','Low'].forEach(k=>document.getElementById('sev'+k).textContent=sc[k.toLowerCase()]||0);let urgent=ss.immediate_attention||[],medium=(incs||[]).filter(x=>x.severity==='medium').length;document.getElementById('attention').innerHTML='<h3>IMMEDIATE ATTENTION</h3>'+(urgent.length?urgent.map(x=>`<div class="event"><div><strong class="bad">${esc(x.container)} · ${esc(x.state)}</strong><span class="tiny">${esc(x.factors[0])}</span></div><b>${x.score}</b></div>`).join(''):`<div class="attention-ok"><div class="check">✓</div>No urgent incidents.${medium?`<div class="warn">${medium} medium incident${medium>1?'s':''} require review.</div>`:''}</div>`);let fc=fs.counts_24h||{},sched=(ts.scheduler||{}).state||(ts.auto_scan_enabled?'starting':'disabled'),trivystatus=sched==='error'?'error':sched.startsWith('scanning:')?'scanning':ins.trivy.status;document.getElementById('engines').innerHTML=engineCard('Falco','🦅',ins.falco.status,`<div class="engine-kpi">${fs.events_24h||0}</div><div class="tiny">Events (24h) · <span class="sev-critical">${fc.critical||0} critical</span> · <span class="sev-high">${fc.high||0} high</span><br>Last event ${age(fs.last_event_age_seconds)}</div>`)+engineCard('Trivy','◇',trivystatus,`<div class="engine-kpi">${ts.scans_24h||0}</div><div class="tiny">Scans (24h) · <span class="sev-critical">${ts.critical_24h||0} critical</span> · <span class="sev-high">${ts.high_24h||0} high</span><br>Scheduler: ${esc(sched)}${(ts.scheduler||{}).last_error?'<br><span class="bad">'+esc((ts.scheduler||{}).last_error).slice(0,100)+'</span>':''}</div>`)+engineCard('ClamAV','⬡',ins.clamav.status,`<div class="engine-kpi">${ins.clamav.status==='ok'?'Clean':'Review'}</div><div class="tiny">Malware scanning sensor</div>`)+engineCard('CrowdSec','♜',ins.crowdsec.status,`<div class="engine-kpi">${ins.crowdsec.status==='ok'?'Active':'Review'}</div><div class="tiny">Host intrusion decisions & firewall context</div>`);document.getElementById('incidents').innerHTML=incs.length?incs.slice(0,8).map(i=>`<div class="event"><div><strong class="${i.severity==='critical'?'bad':i.severity==='high'?'warn':''}">#${i.id} ${esc(i.container_name||'host')} · ${esc(i.severity).toUpperCase()}</strong><span class="tiny">${esc(i.title)} · ${esc((i.sources||[]).join(', '))}</span><div class="event-actions"><button onclick="incidentStatus(${i.id},'investigating')">Investigate</button><button onclick="evidence(${i.id})">Capture Evidence</button><button onclick="resolveIncident(${i.id})">Resolve</button></div></div><span class="tag warn">${esc(i.status)}</span></div>`).join(''):'<div class="attention-ok">✓ No active incidents.</div>';document.getElementById('scoreExplain').innerHTML=(explain.contributors||[]).length?(explain.contributors||[]).slice(0,8).map(x=>`<div class="event"><div><strong>${esc(x.subject)}</strong><span class="tiny">${esc(x.detail)}</span></div><b>−${x.points_lost}</b></div>`).join(''):'<div class="attention-ok">✓ No active deductions.</div>';document.getElementById('leaderboard').innerHTML=(ss.leaderboard||[]).map(x=>`<tr class="clickable" onclick="openDrawer('${esc(x.container)}')"><td><b>${esc(x.container)}</b></td><td><b>${x.score}</b></td><td class="state ${x.score>=75?'good':x.score>=55?'warn':'bad'}">${esc(x.state).toUpperCase()}</td><td>${esc(x.profile)}</td><td class="tiny">${esc(x.factors[0])}</td></tr>`).join('');document.getElementById('activity').innerHTML=ev.map(e=>`<div class="event"><div><strong>${esc(e.icon)} ${esc(e.subject||e.kind)}</strong><span class="tiny">${esc(e.summary)}</span></div><span class="tiny">${new Date(e.ts*1000).toLocaleTimeString()}</span></div>`).join('');drawHistory(hist);document.getElementById('recommendations').innerHTML=recs.length?recs.slice(0,10).map(r=>`<div class="event recommend ${esc(r.priority)}"><div><strong>${esc(r.title)}</strong><span class="tiny">${esc(r.detail)}</span></div><span class="tag ${r.priority==='critical'||r.priority==='high'?'bad':r.priority==='medium'?'warn':'good'}">${esc(r.priority)}</span></div>`).join(''):'<div class="attention-ok">✓ No recommendations right now.</div>';document.getElementById('reporting').innerHTML=`<div class="kv"><b>Discord</b><span class="${ins.discord?.configured?'good':'muted'}">${ins.discord?.configured?'Configured':'Not configured'}</span></div><div class="kv"><b>n8n</b><span class="${ins.n8n?.configured?'good':'muted'}">${ins.n8n?.configured?'Configured':'Not configured'}</span></div><div class="kv"><b>Recent reports</b><span>${reph.length}</span></div>`;document.getElementById('containers').innerHTML=cs.map(c=>{let p=c.policy||{};return `<div class="container-row" onclick="openDrawer('${esc(c.name)}')"><div style="min-width:0"><b>${esc(c.name)}</b> <span class="tag ${c.state==='running'?'good':'bad'}">${esc(c.state)}</span><div class="tiny">${esc(c.image)} · ${esc(c.status)}</div><div class="policybar">${policyButton(c.name,'Approved Rebuild','allow_rebuild',!!p.allow_rebuild)}${policyButton(c.name,'Auto-Isolate','auto_isolate',!!p.auto_isolate)}${policyButton(c.name,'Auto-Restart','auto_restart',!!p.auto_restart)}${policyButton(c.name,'Protected','protected',!!p.protected,'protected')}</div></div><div class="toolbar"><button onclick="event.stopPropagation();act('${esc(c.name)}','start')">Start</button><button onclick="event.stopPropagation();act('${esc(c.name)}','restart')">Restart</button><button class="danger" onclick="event.stopPropagation();act('${esc(c.name)}','stop')">Stop</button><button onclick="event.stopPropagation();scan('${esc(c.name)}')">Trivy</button></div></div>`}).join('');document.getElementById('footerEval').textContent='Last full evaluation '+new Date(ss.evaluated_ts*1000).toLocaleTimeString()}
 if(TOKEN){load().then(()=>document.getElementById('login').classList.add('hidden')).catch(()=>{})}setInterval(()=>{if(TOKEN)load().catch(()=>{})},30000)
-</script></body></html>
-'''
+</script></body></html>'''
+
