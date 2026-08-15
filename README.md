@@ -1,4 +1,4 @@
-# 👑 Kingdom Manager v1.11.2
+# 👑 Kingdom Manager v1.11.3
 
 This release merges the v1.10.1 corroboration fix with the v1.11 adaptive-intelligence roadmap. It keeps the v1.10 incident/Trivy flow and adds baseline-aware scoring that is deliberately advisory: learned behavior can reduce Falco-only score impact when corroborating scanners are clean, but it never auto-suppresses rules or authorizes recovery.
 
@@ -88,7 +88,7 @@ docker logs kingdom-manager --since 5m 2>&1 | \
   grep -iE 'migration|error|exception|traceback|trivy|report'
 ```
 
-The footer should show **v1.11.2**. Trivy may continue the scan already in progress or choose the next oldest/unscanned running container after restart.
+The footer should show **v1.11.3**. Trivy may continue the scan already in progress or choose the next oldest/unscanned running container after restart.
 
 
 ## v1.9 Intelligence + Controlled Recovery
@@ -152,7 +152,7 @@ A behavior is only considered **stable** after both enough repetitions and enoug
 Baseline learning never creates suppressions automatically. `Mark Expected` remains an explicit operator action scoped to an exact container + Falco rule.
 
 
-## v1.11.2 Trust Diagnostics + Scoring Consistency
+## v1.11.3 Canonical Scoring + Trust Pipeline Fix
 
 This patch is a correctness/safety review of the v1.11 adaptive-intelligence path.
 
@@ -186,7 +186,7 @@ KM_KNOWN_GOOD_MAX_ATTENUATION: "45"
 No manual database operation is required. The schema marker advances to v8; existing volumes remain unchanged.
 
 
-## v1.11.2 Trust Diagnostics + Scoring Consistency
+## v1.11.3 Canonical Scoring + Trust Pipeline Fix
 
 - Exact suppression matching is normalized for Falco formatting differences while remaining container+rule scoped.
 - Legacy/pre-approval correlation rows resolve the original Falco rule from the nearest stored event.
