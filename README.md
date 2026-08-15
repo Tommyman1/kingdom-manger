@@ -1,6 +1,6 @@
-# 👑 Kingdom Manager v1.4.0
+# 👑 Kingdom Manager v1.4.1
 
-v1.4.0 fixes sensor health and makes the Decision Engine easier to understand.
+v1.4.1 fixes sensor health and makes the Decision Engine easier to understand.
 
 ## Changes
 
@@ -42,3 +42,14 @@ Trivy      ok
 ```
 
 A quiet Falco sensor can remain `ok`; its last-event age is displayed separately.
+
+
+## v1.4.1 live-test fixes
+
+- Sentinel color now follows the security score: green → lime → amber → orange → red.
+- Core sensor outages reduce monitoring confidence; the dashboard cannot claim 100/100 while Falco, ClamAV, CrowdSec, or Trivy is unavailable.
+- Falco sample stack explicitly enables the private health listener on `8765`; no host port is published.
+- Trivy automatic coverage starts after 45 seconds, scans at most one container every 30 minutes, and records scheduler state, last success, and last error in the dashboard.
+- Trivy scan failures are visible instead of silently leaving `Scans (24h): 0`.
+
+Keep your existing `kingdom-manager-data` volume and replace the placeholder CrowdSec key with your current rotated bouncer key before deployment.

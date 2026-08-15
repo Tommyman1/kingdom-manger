@@ -24,6 +24,12 @@ services:
       - http_output.enabled=true
       - -o
       - http_output.url=http://kingdom-manager:8080/api/security/falco?token=kingdom-falco-2026-change-this
+      - -o
+      - webserver.enabled=true
+      - -o
+      - webserver.listen_port=8765
+      - -o
+      - webserver.k8s_healthz_endpoint=/healthz
     volumes:
       - /proc:/host/proc:ro
       - /etc:/host/etc:ro

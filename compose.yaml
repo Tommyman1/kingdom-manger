@@ -3,7 +3,7 @@ services:
     build:
       context: ./app
       dockerfile: Dockerfile
-    image: kingdom-manager:1.4.0
+    image: kingdom-manager:1.4.1
     container_name: kingdom-manager
     restart: unless-stopped
     environment:
@@ -29,7 +29,8 @@ services:
       FALCO_HOST: falco
       FALCO_HEALTH_PORT: "8765"
       TRIVY_AUTO_SCAN_ENABLED: "true"
-      TRIVY_AUTO_SCAN_EVERY_SECONDS: "3600"
+      TRIVY_AUTO_SCAN_EVERY_SECONDS: "1800"
+      TRIVY_AUTO_SCAN_START_DELAY_SECONDS: "45"
       TRIVY_RESCAN_SECONDS: "604800"
     volumes:
       - kingdom-manager-data:/data
