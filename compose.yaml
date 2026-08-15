@@ -3,7 +3,7 @@ services:
     build:
       context: ./app
       dockerfile: Dockerfile
-    image: kingdom-manager:1.7.0
+    image: kingdom-manager:1.9.0
     container_name: kingdom-manager
     restart: unless-stopped
     environment:
@@ -20,6 +20,9 @@ services:
       KM_DECISION_DEBOUNCE_SECONDS: "120"
       KM_TRIVY_CONTEXT_SECONDS: "604800"
       KM_RECOVERY_APPROVAL_TTL_SECONDS: "900"
+      KM_RECOVERY_OBSERVATION_SECONDS: "30"
+      KM_RECOVERY_BLOCK_ON_CRITICAL_CVE: "true"
+      KM_RECOVERY_ALLOW_DATABASES: "false"
       TRIVY_RUNNER: kingdom-manager-trivy
       DISCORD_WEBHOOK_URL: ""
       N8N_WEBHOOK_URL: ""
@@ -62,7 +65,7 @@ services:
     labels:
       homepage.group: Network
       homepage.name: Kingdom Manager
-      homepage.description: Incident response, controlled recovery, security decisions, scans, and container lifecycle
+      homepage.description: Security intelligence, investigation, controlled recovery, decisions, scans, and container lifecycle
       homepage.icon: mdi-crown
       homepage.href: https://kingdom-manager-tail.kingdom.local
 

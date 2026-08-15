@@ -1,4 +1,4 @@
-# 👑 Kingdom Manager v1.7.0
+# 👑 Kingdom Manager v1.9.0
 
 This release combines the planned **v1.6.2 trust/polish work** with **v1.7 reporting, history, and notifications**.
 
@@ -88,4 +88,36 @@ docker logs kingdom-manager --since 5m 2>&1 | \
   grep -iE 'migration|error|exception|traceback|trivy|report'
 ```
 
-The footer should show **v1.7.0**. Trivy may continue the scan already in progress or choose the next oldest/unscanned running container after restart.
+The footer should show **v1.9.0**. Trivy may continue the scan already in progress or choose the next oldest/unscanned running container after restart.
+
+
+## v1.9 Intelligence + Controlled Recovery
+
+v1.9 combines the investigation and recovery roadmap into one approval-gated release.
+
+### Incident Intelligence
+- **Investigate** opens a case view that groups Falco rules, counts repetitions, shows first/last observation, Trivy context, ClamAV/CrowdSec corroboration, and a Kingdom assessment.
+- Assessments are labeled `likely-expected`, `unverified`, `suspicious`, or `high-confidence-threat` with an explicit confidence percentage and factors.
+- **Mark Expected** creates a narrow suppression for *that container + that Falco rule* and dismisses the incident. It does not disable the Falco rule globally.
+- The normal activity feed hides routine idle telemetry by default so incident/recovery/security actions remain visible.
+
+### Controlled Recovery
+Recovery remains opt-in. A container must have **Approved Rebuild** enabled and **Protected** disabled. Kingdom core containers are hard-blocked.
+
+Approved recovery performs:
+1. Evidence capture and current configuration snapshot.
+2. Isolation from service networks.
+3. Pull of the configured image.
+4. Removal of the old container only after approval.
+5. Creation of a replacement candidate on the private quarantine network **without published ports**.
+6. Trivy verification while the candidate remains quarantined.
+7. If `KM_RECOVERY_BLOCK_ON_CRITICAL_CVE=true` and critical CVEs are found, recovery stops safely and leaves the candidate quarantined.
+8. Recreate the final container with captured host configuration and original networks.
+9. Observe runtime/health for `KM_RECOVERY_OBSERVATION_SECONDS`.
+10. On failed observation, Kingdom Manager attempts to isolate the replacement again and marks the plan failed.
+11. On success, the incident is resolved and the full recovery audit trail is retained.
+
+This is **not autonomous self-healing by default**: recovery still requires an operator-created plan and a second approval within the configured approval window.
+
+### Additional recovery guardrail
+Database containers are blocked from automated rebuild by default (`KM_RECOVERY_ALLOW_DATABASES=false`) even if Approved Rebuild is toggled. This is intentional because database recovery should be backup-aware.
