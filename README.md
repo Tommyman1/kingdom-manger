@@ -53,3 +53,28 @@ A quiet Falco sensor can remain `ok`; its last-event age is displayed separately
 - Trivy scan failures are visible instead of silently leaving `Scans (24h): 0`.
 
 Keep your existing `kingdom-manager-data` volume and replace the placeholder CrowdSec key with your current rotated bouncer key before deployment.
+
+## v1.6.1 — UI Recovery Policies + Incident Response
+
+This release merges the planned v1.5 investigation layer and v1.6 recovery layer.
+
+New capabilities:
+- Incident Center: medium/high/critical correlations become persistent incidents.
+- Evidence Vault: capture Docker state plus an on-demand Trivy scan into the incident record.
+- Explain My Score endpoint and dashboard panel.
+- Maintenance mode per container so planned work is recorded without escalating risk.
+- Approval-gated recovery plans with a 15-minute default approval window.
+- Dedicated recovery Docker socket proxy. DELETE access is isolated from the normal manager proxy.
+- Recovery flow: snapshot -> isolate -> pull image -> recreate -> start -> Trivy verification.
+- Hard protection prevents Kingdom Manager and its socket/Trivy helper containers from self-rebuild.
+
+### Recovery safety
+Recovery is OFF per container by default. To create a recovery plan, the container policy must have `allow_rebuild=true` and `protected=false`. Creating a plan does not execute it. Execution requires a separate authenticated `approve-and-run` request before the plan expires.
+
+Back up persistent application data before enabling rebuilds. The recovery engine recreates container configuration; it does not repair corrupted application data inside bind mounts or named volumes.
+
+
+### v1.6.1 recovery-policy UI
+Recovery permissions are now managed directly from **Container Life & Controls**. Each container has database-backed toggles for **Approved Rebuild**, **Auto-Isolate**, **Auto-Restart**, and **Protected**. You do not need to add `allow_rebuild=true` labels to every Docker Compose file.
+
+`Approved Rebuild` only permits a separately approved recovery plan to recreate that container; it does not enable automatic destructive recovery. `Protected` blocks isolation/rebuild actions until you deliberately disable protection.

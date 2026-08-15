@@ -3,7 +3,7 @@ services:
     build:
       context: ./app
       dockerfile: Dockerfile
-    image: kingdom-manager:1.4.1
+    image: kingdom-manager:1.6.1
     container_name: kingdom-manager
     restart: unless-stopped
     environment:
@@ -11,6 +11,7 @@ services:
       KM_DATA_DIR: /data
       KM_API_TOKEN: "kingdom-manager-change-this-2026"
       DOCKER_HOST: tcp://docker-socket-proxy:2375
+      RECOVERY_DOCKER_HOST: tcp://recovery-socket-proxy:2375
       KM_QUARANTINE_NETWORK: kingdom-quarantine
       KM_CHECK_SECONDS: "300"
       KM_IDLE_CPU_PERCENT: "3.0"
@@ -18,6 +19,7 @@ services:
       KM_DECISION_WINDOW_SECONDS: "900"
       KM_DECISION_DEBOUNCE_SECONDS: "120"
       KM_TRIVY_CONTEXT_SECONDS: "604800"
+      KM_RECOVERY_APPROVAL_TTL_SECONDS: "900"
       TRIVY_RUNNER: kingdom-manager-trivy
       DISCORD_WEBHOOK_URL: ""
       N8N_WEBHOOK_URL: ""
@@ -41,6 +43,8 @@ services:
     depends_on:
       docker-socket-proxy:
         condition: service_started
+      recovery-socket-proxy:
+        condition: service_started
       trivy-runner:
         condition: service_started
     healthcheck:
@@ -52,7 +56,7 @@ services:
     labels:
       homepage.group: Network
       homepage.name: Kingdom Manager
-      homepage.description: Docker lifecycle, security decisions, recovery, scans, and reporting
+      homepage.description: Incident response, controlled recovery, security decisions, scans, and container lifecycle
       homepage.icon: mdi-crown
       homepage.href: https://kingdom-manager-tail.kingdom.local
 
@@ -71,6 +75,39 @@ services:
       POST: 1
       DELETE: 0
       EXEC: 1
+      BUILD: 0
+      COMMIT: 0
+      CONFIGS: 0
+      DISTRIBUTION: 0
+      NODES: 0
+      PLUGINS: 0
+      SECRETS: 0
+      SESSION: 0
+      SWARM: 0
+      SYSTEM: 0
+      VOLUMES: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - kingdom-manager-internal
+    security_opt:
+      - no-new-privileges:true
+
+  recovery-socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: kingdom-manager-recovery-docker-api
+    restart: unless-stopped
+    environment:
+      CONTAINERS: 1
+      IMAGES: 1
+      INFO: 1
+      NETWORKS: 1
+      EVENTS: 0
+      PING: 1
+      VERSION: 1
+      POST: 1
+      DELETE: 1
+      EXEC: 0
       BUILD: 0
       COMMIT: 0
       CONFIGS: 0
