@@ -3,7 +3,7 @@ services:
     build:
       context: ./app
       dockerfile: Dockerfile
-    image: kingdom-manager:1.10.0
+    image: kingdom-manager:1.11.0
     container_name: kingdom-manager
     restart: unless-stopped
     environment:
@@ -43,6 +43,11 @@ services:
       KM_WEEKLY_REPORT_WEEKDAY: "0"
       KM_WEEKLY_REPORT_HOUR: "9"
       KM_SCORE_HISTORY_INTERVAL_SECONDS: "900"
+      KM_BASELINE_DAYS: "7"
+      KM_BASELINE_STABLE_MIN_EVENTS: "100"
+      KM_BASELINE_STABLE_MIN_HOURS: "12"
+      KM_BASELINE_STABLE_ATTENUATION: "20"
+      KM_BASELINE_LEARNING_ATTENUATION: "8"
     volumes:
       - kingdom-manager-data:/data
     networks:

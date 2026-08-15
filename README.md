@@ -1,6 +1,6 @@
-# 👑 Kingdom Manager v1.9.0
+# 👑 Kingdom Manager v1.11.0
 
-This release combines the planned **v1.6.2 trust/polish work** with **v1.7 reporting, history, and notifications**.
+This release merges the v1.10.1 corroboration fix with the v1.11 adaptive-intelligence roadmap. It keeps the v1.10 incident/Trivy flow and adds baseline-aware scoring that is deliberately advisory: learned behavior can reduce Falco-only score impact when corroborating scanners are clean, but it never auto-suppresses rules or authorizes recovery.
 
 ## What changed
 
@@ -122,7 +122,7 @@ This is **not autonomous self-healing by default**: recovery still requires an o
 ### Additional recovery guardrail
 Database containers are blocked from automated rebuild by default (`KM_RECOVERY_ALLOW_DATABASES=false`) even if Approved Rebuild is toggled. This is intentional because database recovery should be backup-aware.
 
-## v1.10.0 Intelligence + Explainability + Noise Control
+## v1.11.0 Adaptive Intelligence + Baseline-Aware Risk
 
 - Auditable confidence math for incident assessments, including deltas from the prior assessment.
 - Clear Falco scope: incident-matching events are shown separately from Kingdom-wide Falco totals.
@@ -134,3 +134,19 @@ Database containers are blocked from automated rebuild by default (`KM_RECOVERY_
 - Incident API supports status, severity, container, text query, and age filters.
 - Incident assessment history stores confidence and security-score snapshots for auditability.
 - Existing recovery controls remain approval-gated and protected/database safeguards remain unchanged.
+
+## Adaptive baseline tuning
+
+Defaults are intentionally conservative:
+
+```yaml
+KM_BASELINE_DAYS: "7"
+KM_BASELINE_STABLE_MIN_EVENTS: "100"
+KM_BASELINE_STABLE_MIN_HOURS: "12"
+KM_BASELINE_STABLE_ATTENUATION: "20"
+KM_BASELINE_LEARNING_ATTENUATION: "8"
+```
+
+A behavior is only considered **stable** after both enough repetitions and enough elapsed time. A short burst of thousands of alerts is treated as noise/novelty, not a trustworthy baseline. Stable/learning baselines can attenuate *Falco-only* risk only when a recent Trivy scan is clean. ClamAV or CrowdSec corroboration, critical/high Trivy findings, or multi-engine evidence bypass this attenuation.
+
+Baseline learning never creates suppressions automatically. `Mark Expected` remains an explicit operator action scoped to an exact container + Falco rule.
