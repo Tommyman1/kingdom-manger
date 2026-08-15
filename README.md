@@ -1,4 +1,4 @@
-# 👑 Kingdom Manager v1.11.3
+# 👑 Kingdom Manager v2.0.0
 
 This release merges the v1.10.1 corroboration fix with the v1.11 adaptive-intelligence roadmap. It keeps the v1.10 incident/Trivy flow and adds baseline-aware scoring that is deliberately advisory: learned behavior can reduce Falco-only score impact when corroborating scanners are clean, but it never auto-suppresses rules or authorizes recovery.
 
@@ -88,7 +88,7 @@ docker logs kingdom-manager --since 5m 2>&1 | \
   grep -iE 'migration|error|exception|traceback|trivy|report'
 ```
 
-The footer should show **v1.11.3**. Trivy may continue the scan already in progress or choose the next oldest/unscanned running container after restart.
+The footer should show **v2.0.0**. Trivy may continue the scan already in progress or choose the next oldest/unscanned running container after restart.
 
 
 ## v1.9 Intelligence + Controlled Recovery
@@ -152,7 +152,7 @@ A behavior is only considered **stable** after both enough repetitions and enoug
 Baseline learning never creates suppressions automatically. `Mark Expected` remains an explicit operator action scoped to an exact container + Falco rule.
 
 
-## v1.11.3 Canonical Scoring + Trust Pipeline Fix
+## v2.0.0 Canonical Scoring + Trust Pipeline Fix
 
 This patch is a correctness/safety review of the v1.11 adaptive-intelligence path.
 
@@ -186,7 +186,7 @@ KM_KNOWN_GOOD_MAX_ATTENUATION: "45"
 No manual database operation is required. The schema marker advances to v8; existing volumes remain unchanged.
 
 
-## v1.11.3 Canonical Scoring + Trust Pipeline Fix
+## v2.0.0 Canonical Scoring + Trust Pipeline Fix
 
 - Exact suppression matching is normalized for Falco formatting differences while remaining container+rule scoped.
 - Legacy/pre-approval correlation rows resolve the original Falco rule from the nearest stored event.
@@ -194,3 +194,18 @@ No manual database operation is required. The schema marker advances to v8; exis
 - New **Trust** diagnostics drawer shows active approvals, matching events, matching correlation rows, points removed, expiry, and the precise blocker when attenuation cannot apply.
 - Security score, leaderboard, severity counters, and Explain My Score all share the same suppression-aware effective-risk path.
 - Existing Trivy error-state hardening and controlled-recovery safety remain enabled.
+
+## Kingdom Manager 2.0
+
+Version 2.0 promotes Kingdom Manager from a single-score dashboard to an evidence-gated security control plane.
+
+### 2.0 control-plane additions
+- Multidimensional posture: Threat, Vulnerability, Exposure, Monitoring, and Trust.
+- `/api/security/posture` exposes the complete 2.0 posture model and automation boundary.
+- Adaptive incident playbooks at `/api/incidents/{id}/playbook` select evidence, scan, isolation, recovery, observation, and resolution steps from incident context.
+- Destructive recovery remains approval-gated. A sensor alert alone cannot authorize a rebuild.
+- ClamAV health now uses clamd's canonical `zPING\0` protocol and reports reachability/response separately from alert state.
+- Existing v1.11 suppression, baseline learning, Trivy scheduling, incident investigation, evidence capture, isolation, controlled rebuild, reporting, and audit behavior are retained.
+
+### Recommended rollout
+Back up the `kingdom-manager-data` volume before the first 2.0 start. The application schema is version 10 and retains its migration backup behavior. Deploy the stack, then verify `/health`, `/api/security/posture`, the four engine cards, and one non-destructive incident playbook before enabling any additional recovery policy.
