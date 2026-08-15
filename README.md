@@ -1,4 +1,4 @@
-# 👑 Kingdom Manager v1.9.0
+# 👑 Kingdom Manager v1.9.1
 
 This release combines the planned **v1.6.2 trust/polish work** with **v1.7 reporting, history, and notifications**.
 
@@ -88,7 +88,7 @@ docker logs kingdom-manager --since 5m 2>&1 | \
   grep -iE 'migration|error|exception|traceback|trivy|report'
 ```
 
-The footer should show **v1.9.0**. Trivy may continue the scan already in progress or choose the next oldest/unscanned running container after restart.
+The footer should show **v1.9.1**. Trivy may continue the scan already in progress or choose the next oldest/unscanned running container after restart.
 
 
 ## v1.9 Intelligence + Controlled Recovery
@@ -121,3 +121,12 @@ This is **not autonomous self-healing by default**: recovery still requires an o
 
 ### Additional recovery guardrail
 Database containers are blocked from automated rebuild by default (`KM_RECOVERY_ALLOW_DATABASES=false`) even if Approved Rebuild is toggled. This is intentional because database recovery should be backup-aware.
+
+## v1.9.1 route and incident-scan fix
+
+- Removed the FastAPI route collision between generic container actions and dedicated endpoints such as `/trivy`.
+- Generic lifecycle operations now use `/api/containers/{name}/action/{action}`.
+- Isolation continues to use its dedicated `/api/containers/{name}/isolate` endpoint.
+- Incident `Scan Now` now uses a dedicated incident scan flow, refreshes the investigation after Trivy finishes, and keeps the incident drawer open with updated corroboration.
+- Added in-app Kingdom toast notifications for scan/action feedback instead of browser alerts in the repaired flows.
+- No database schema change from v1.9.0; existing `kingdom-manager-data` remains compatible.
