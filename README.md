@@ -1,4 +1,4 @@
-# 👑 Kingdom Manager v1.11.0
+# 👑 Kingdom Manager v1.11.1
 
 This release merges the v1.10.1 corroboration fix with the v1.11 adaptive-intelligence roadmap. It keeps the v1.10 incident/Trivy flow and adds baseline-aware scoring that is deliberately advisory: learned behavior can reduce Falco-only score impact when corroborating scanners are clean, but it never auto-suppresses rules or authorizes recovery.
 
@@ -88,7 +88,7 @@ docker logs kingdom-manager --since 5m 2>&1 | \
   grep -iE 'migration|error|exception|traceback|trivy|report'
 ```
 
-The footer should show **v1.9.0**. Trivy may continue the scan already in progress or choose the next oldest/unscanned running container after restart.
+The footer should show **v1.11.1**. Trivy may continue the scan already in progress or choose the next oldest/unscanned running container after restart.
 
 
 ## v1.9 Intelligence + Controlled Recovery
@@ -150,3 +150,37 @@ KM_BASELINE_LEARNING_ATTENUATION: "8"
 A behavior is only considered **stable** after both enough repetitions and enough elapsed time. A short burst of thousands of alerts is treated as noise/novelty, not a trustworthy baseline. Stable/learning baselines can attenuate *Falco-only* risk only when a recent Trivy scan is clean. ClamAV or CrowdSec corroboration, critical/high Trivy findings, or multi-engine evidence bypass this attenuation.
 
 Baseline learning never creates suppressions automatically. `Mark Expected` remains an explicit operator action scoped to an exact container + Falco rule.
+
+
+## v1.11.1 Trust Pipeline Hardening
+
+This patch is a correctness/safety review of the v1.11 adaptive-intelligence path.
+
+### Known-good scoring is now immediate and suppression-aware
+- Security score evaluation re-checks active suppressions at read time, so an older unsuppressed correlation run cannot keep penalizing a rule after an operator approves it.
+- Exact `container + source + rule` suppressions can attenuate the stored correlation score down to a small configurable residual risk instead of silently erasing the evidence.
+- Score explanations show the original correlation score, the known-good adjustment, and the resulting effective score.
+- Expired suppressions stop affecting risk automatically.
+- Multi-engine evidence is recalculated from unsuppressed signals; a known-good Falco rule does not suppress independent ClamAV/CrowdSec/Trivy context.
+
+Defaults:
+```yaml
+KM_KNOWN_GOOD_RESIDUAL_RISK: "5"
+KM_KNOWN_GOOD_MAX_ATTENUATION: "45"
+```
+
+### Trivy error-state hardening
+- A failed Trivy attempt is shown as **SCAN ERROR**, never as a clean `0 critical / 0 high / 0 medium` result.
+- Container profiles expose **Latest scan attempt** separately from **Last successful scan**.
+- Adaptive baseline confidence uses only a successful Trivy result.
+- Recommendations explicitly request a retry after a failed scan.
+- Reports count successful Trivy scans separately and expose an error count.
+- Controlled recovery now blocks and leaves the replacement quarantined if Trivy verification itself fails. A scan error can never be interpreted as permission to restore service networks.
+
+### Expected-evidence UX
+- Recent Falco evidence now shows `EXPECTED` with expiry instead of continuing to offer `Mark Expected`.
+- Baseline Learning shows approved scopes as `EXPECTED` and displays the effective adjustment.
+- Incident investigation recognizes an approved exact rule, raises the expected-confidence path, and presents the operator approval in the confidence explanation.
+
+### Upgrade
+No manual database operation is required. The schema marker advances to v8; existing volumes remain unchanged.
