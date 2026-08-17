@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import sqlite3
@@ -15,7 +16,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-VERSION = "2.0.0"
+VERSION = "3.1.0"
 app = FastAPI(title="Kingdom Manager", version=VERSION)
 
 DOCKER = os.getenv("DOCKER_HOST", "tcp://docker-socket-proxy:2375").replace("tcp://", "http://")
@@ -62,7 +63,37 @@ BASELINE_STABLE_ATTENUATION = int(os.getenv("KM_BASELINE_STABLE_ATTENUATION", "2
 BASELINE_LEARNING_ATTENUATION = int(os.getenv("KM_BASELINE_LEARNING_ATTENUATION", "8"))
 KNOWN_GOOD_RESIDUAL_RISK = int(os.getenv("KM_KNOWN_GOOD_RESIDUAL_RISK", "5"))
 KNOWN_GOOD_MAX_ATTENUATION = int(os.getenv("KM_KNOWN_GOOD_MAX_ATTENUATION", "45"))
-SCHEMA_VERSION = 10
+SENSOR_FAILURE_GRACE_SECONDS = int(os.getenv("KM_SENSOR_FAILURE_GRACE_SECONDS", "120"))
+PLAYBOOKS_ENABLED = os.getenv("KM_PLAYBOOKS_ENABLED", "true").lower() in {"1","true","yes","on"}
+PLAYBOOK_AUTO_EVIDENCE = os.getenv("KM_PLAYBOOK_AUTO_EVIDENCE", "true").lower() in {"1","true","yes","on"}
+PLAYBOOK_AUTO_SCAN = os.getenv("KM_PLAYBOOK_AUTO_SCAN", "true").lower() in {"1","true","yes","on"}
+PLAYBOOK_AUTO_ISOLATE = os.getenv("KM_PLAYBOOK_AUTO_ISOLATE", "false").lower() in {"1","true","yes","on"}
+PLAYBOOK_AUTO_RECOVER = os.getenv("KM_PLAYBOOK_AUTO_RECOVER", "false").lower() in {"1","true","yes","on"}
+IGNORE_HTTP_TRANSPORT_ERRORS = os.getenv("KM_IGNORE_HTTP_TRANSPORT_ERRORS", "true").lower() in {"1","true","yes","on"}
+UPDATE_ENGINE_ENABLED = os.getenv("KM_UPDATE_ENGINE_ENABLED", "true").lower() in {"1","true","yes","on"}
+UPDATE_CHECK_SECONDS = int(os.getenv("KM_UPDATE_CHECK_SECONDS", "21600"))
+UPDATE_START_DELAY_SECONDS = int(os.getenv("KM_UPDATE_START_DELAY_SECONDS", "180"))
+UPDATE_OBSERVATION_SECONDS = int(os.getenv("KM_UPDATE_OBSERVATION_SECONDS", "60"))
+UPDATE_REQUIRE_TRIVY = os.getenv("KM_UPDATE_REQUIRE_TRIVY", "true").lower() in {"1","true","yes","on"}
+UPDATE_BLOCK_CRITICAL = os.getenv("KM_UPDATE_BLOCK_CRITICAL_CVE", "true").lower() in {"1","true","yes","on"}
+UPDATE_BLOCK_HIGH = os.getenv("KM_UPDATE_BLOCK_HIGH_CVE", "false").lower() in {"1","true","yes","on"}
+UPDATE_AUTO_APPLY = os.getenv("KM_UPDATE_AUTO_APPLY", "false").lower() in {"1","true","yes","on"}
+UPDATE_ALLOW_STATEFUL = os.getenv("KM_UPDATE_ALLOW_STATEFUL", "false").lower() in {"1","true","yes","on"}
+ROLLBACK_RETENTION = int(os.getenv("KM_ROLLBACK_RETENTION", "10"))
+PORTAINER_URL = os.getenv("PORTAINER_URL", "").rstrip('/')
+PORTAINER_API_KEY = os.getenv("PORTAINER_API_KEY", "")
+PORTAINER_STACK_ID = os.getenv("PORTAINER_STACK_ID", "")
+COMPOSE_SNAPSHOT_PATH = os.getenv("KM_COMPOSE_SNAPSHOT_PATH", "")
+DASHBOARD_URL = os.getenv("KM_DASHBOARD_URL", "https://kingdom-manager-tail.kingdom.local").rstrip("/")
+DISCORD_ROLE_ID = os.getenv("DISCORD_MENTION_ROLE_ID", "").strip()
+DISCORD_NOTIFY_UPDATES = os.getenv("DISCORD_NOTIFY_UPDATES", "true").lower() in {"1","true","yes","on"}
+DISCORD_NOTIFY_RECOVERY = os.getenv("DISCORD_NOTIFY_RECOVERY", "true").lower() in {"1","true","yes","on"}
+DISCORD_NOTIFY_SENSOR_FAILURES = os.getenv("DISCORD_NOTIFY_SENSOR_FAILURES", "true").lower() in {"1","true","yes","on"}
+DRIFT_SCAN_ENABLED = os.getenv("KM_DRIFT_SCAN_ENABLED", "true").lower() in {"1","true","yes","on"}
+DRIFT_SCAN_SECONDS = int(os.getenv("KM_DRIFT_SCAN_SECONDS", "1800"))
+BACKUP_MAX_AGE_HOURS = int(os.getenv("KM_BACKUP_MAX_AGE_HOURS", "48"))
+AUTO_SAFE_PLAYBOOKS = os.getenv("KM_AUTO_SAFE_PLAYBOOKS", "true").lower() in {"1","true","yes","on"}
+SCHEMA_VERSION = 15
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -149,15 +180,29 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS report_history(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, report_type TEXT NOT NULL,payload TEXT NOT NULL, delivered_discord INTEGER NOT NULL DEFAULT 0, delivered_n8n INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS incident_assessments(id INTEGER PRIMARY KEY AUTOINCREMENT, incident_id INTEGER NOT NULL, ts INTEGER NOT NULL,classification TEXT NOT NULL, confidence INTEGER NOT NULL, summary TEXT NOT NULL, factors_json TEXT NOT NULL,top_rule TEXT, FOREIGN KEY(incident_id) REFERENCES incidents(id) ON DELETE CASCADE);
         CREATE TABLE IF NOT EXISTS recovery_steps(id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER NOT NULL, ts INTEGER NOT NULL,step TEXT NOT NULL, status TEXT NOT NULL, detail TEXT, FOREIGN KEY(plan_id) REFERENCES recovery_plans(id) ON DELETE CASCADE);
+        CREATE TABLE IF NOT EXISTS playbook_runs(id INTEGER PRIMARY KEY AUTOINCREMENT, incident_id INTEGER NOT NULL, created_ts INTEGER NOT NULL, completed_ts INTEGER, status TEXT NOT NULL DEFAULT 'running', plan_json TEXT NOT NULL DEFAULT '{}', result_json TEXT NOT NULL DEFAULT '{}', FOREIGN KEY(incident_id) REFERENCES incidents(id) ON DELETE CASCADE);
+        CREATE TABLE IF NOT EXISTS sensor_health_history(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, sensor TEXT NOT NULL, status TEXT NOT NULL, detail TEXT, latency_ms INTEGER);
+        CREATE TABLE IF NOT EXISTS config_snapshots(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, container_name TEXT NOT NULL, reason TEXT NOT NULL, image_ref TEXT, image_id TEXT, inspect_json TEXT NOT NULL, compose_text TEXT, compose_source TEXT, env_json TEXT NOT NULL DEFAULT '[]', labels_json TEXT NOT NULL DEFAULT '{}', networks_json TEXT NOT NULL DEFAULT '{}', verified INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS update_plans(id INTEGER PRIMARY KEY AUTOINCREMENT, created_ts INTEGER NOT NULL, container_name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'detected', snapshot_id INTEGER, image_ref TEXT NOT NULL, old_image_id TEXT, candidate_image_id TEXT, scan_json TEXT, result_json TEXT NOT NULL DEFAULT '{}', approved_ts INTEGER, executed_ts INTEGER, rollback_snapshot_id INTEGER);
+        CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, actor TEXT NOT NULL DEFAULT 'kingdom', action TEXT NOT NULL, subject TEXT, outcome TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '{}');
+        CREATE TABLE IF NOT EXISTS config_baselines(container_name TEXT PRIMARY KEY, ts INTEGER NOT NULL, fingerprint TEXT NOT NULL, config_json TEXT NOT NULL, actor TEXT NOT NULL DEFAULT 'operator');
+        CREATE TABLE IF NOT EXISTS backup_status(container_name TEXT PRIMARY KEY, verified_ts INTEGER NOT NULL, provider TEXT NOT NULL DEFAULT 'manual', detail TEXT NOT NULL DEFAULT '');
+        CREATE TABLE IF NOT EXISTS validation_runs(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, status TEXT NOT NULL, result_json TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS idx_config_snapshots_container_ts ON config_snapshots(container_name,ts);
+        CREATE INDEX IF NOT EXISTS idx_update_plans_container_ts ON update_plans(container_name,created_ts);
+        CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
+        CREATE INDEX IF NOT EXISTS idx_validation_ts ON validation_runs(ts);
         CREATE INDEX IF NOT EXISTS idx_incident_assessment_incident_ts ON incident_assessments(incident_id, ts);
         CREATE INDEX IF NOT EXISTS idx_recovery_steps_plan_ts ON recovery_steps(plan_id, ts);
+        CREATE INDEX IF NOT EXISTS idx_playbook_runs_incident_ts ON playbook_runs(incident_id, created_ts);
+        CREATE INDEX IF NOT EXISTS idx_sensor_health_sensor_ts ON sensor_health_history(sensor, ts);
         CREATE INDEX IF NOT EXISTS idx_security_events_subject_ts ON security_events(container_name, ts);
         CREATE INDEX IF NOT EXISTS idx_correlation_subject_ts ON correlation_runs(container_name, ts);
         CREATE INDEX IF NOT EXISTS idx_score_history_ts ON score_history(ts);
         """)
     _migrate_events_if_needed()
     with conn() as c:
-        for name, decl in {'auto_restart':'INTEGER NOT NULL DEFAULT 1','auto_update':'INTEGER NOT NULL DEFAULT 0','auto_isolate':'INTEGER NOT NULL DEFAULT 0','allow_rebuild':'INTEGER NOT NULL DEFAULT 0','protected':'INTEGER NOT NULL DEFAULT 0','idle_cpu':'REAL NOT NULL DEFAULT 3.0','idle_minutes':'INTEGER NOT NULL DEFAULT 20'}.items():
+        for name, decl in {'auto_restart':'INTEGER NOT NULL DEFAULT 1','auto_update':'INTEGER NOT NULL DEFAULT 0','auto_isolate':'INTEGER NOT NULL DEFAULT 0','allow_rebuild':'INTEGER NOT NULL DEFAULT 0','protected':'INTEGER NOT NULL DEFAULT 0','idle_cpu':'REAL NOT NULL DEFAULT 3.0','idle_minutes':'INTEGER NOT NULL DEFAULT 20','criticality':"TEXT NOT NULL DEFAULT 'normal'",'update_ring':'INTEGER NOT NULL DEFAULT 2','require_backup':'INTEGER NOT NULL DEFAULT 1'}.items():
             _ensure_column(c, 'policies', name, decl)
         _ensure_column(c, 'suppressions', 'expires_ts', 'INTEGER')
         _ensure_column(c, 'suppressions', 'created_ts', 'INTEGER')
@@ -218,7 +263,7 @@ async def list_containers(all_: bool = True) -> list[dict]:
             "name": (c.get("Names") or [""])[0].lstrip("/"),
             "image": c.get("Image", ""), "image_id": c.get("ImageID", ""),
             "state": c.get("State", "unknown"), "status": c.get("Status", ""),
-            "labels": c.get("Labels") or {},
+            "labels": c.get("Labels") or {}, "ports": c.get("Ports") or [],
         })
     return out
 
@@ -227,8 +272,11 @@ def default_policy(name: str) -> dict:
     with conn() as c:
         r = c.execute("SELECT * FROM policies WHERE container_name=?", (name,)).fetchone()
         if not r:
-            c.execute("INSERT INTO policies(container_name,idle_cpu,idle_minutes) VALUES(?,?,?)",
-                      (name, IDLE_CPU, IDLE_MINUTES))
+            n=(name or '').lower(); core=any(x in n for x in ('kingdom-manager','docker-api','portainer','proxy-manager','falco','clamav','crowdsec','trivy'))
+            crit='critical' if core else ('high' if any(x in n for x in ('postgres','mysql','mariadb','redis','vaultwarden')) else 'normal')
+            ring=4 if core or crit=='high' else 2
+            c.execute("INSERT INTO policies(container_name,idle_cpu,idle_minutes,protected,criticality,update_ring,require_backup) VALUES(?,?,?,?,?,?,?)",
+                      (name, IDLE_CPU, IDLE_MINUTES, int(core), crit, ring, 1))
             r = c.execute("SELECT * FROM policies WHERE container_name=?", (name,)).fetchone()
     return dict(r)
 
@@ -286,7 +334,11 @@ async def notify(title: str, body: str, severity: str = "info", force: bool = Fa
         async with httpx.AsyncClient(timeout=10) as client:
             if DISCORD_WEBHOOK:
                 try:
-                    r=await client.post(DISCORD_WEBHOOK,json={"content":f"👑 **{title}**\n{body}"}); discord_status=f"http-{r.status_code}"
+                    mention = f"<@&{DISCORD_ROLE_ID}> " if DISCORD_ROLE_ID and severity in {"high","critical"} else ""
+                    color = 0xED4245 if severity=="critical" else 0xF0A020 if severity in {"high","warning","medium"} else 0x57F287 if severity in {"info","low","notice"} else 0x5865F2
+                    embed={"title":f"♛ {title}"[:256],"description":body[:3900],"color":color,"footer":{"text":f"Kingdom Manager v{VERSION}"},"timestamp":datetime.now(TZ).isoformat()}
+                    if DASHBOARD_URL: embed["url"]=DASHBOARD_URL
+                    r=await client.post(DISCORD_WEBHOOK,json={"content":mention,"embeds":[embed],"allowed_mentions":{"roles":[DISCORD_ROLE_ID] if DISCORD_ROLE_ID else []}}); discord_status=f"http-{r.status_code}"
                 except Exception as e:
                     discord_status="error:"+str(e)[:180]; event("notify_error","discord",str(e),"warning")
             if N8N_WEBHOOK:
@@ -815,6 +867,18 @@ async def correlate_security(name: str | None, trigger_source: str, trigger_seve
     return {"id": decision_id, "correlation_id": correlation_id, "decision": action, "risk": risk, "score": score, "sources": sources, "signals": signals, "executed": execute, "result": result}
 
 
+def global_maintenance_active() -> bool:
+    with conn() as c:
+        r=c.execute("SELECT value FROM settings WHERE key='global_maintenance'").fetchone()
+    if not r: return False
+    d=_safe_json(r[0],{}) or {}
+    if not d.get('enabled'): return False
+    until=d.get('until_ts')
+    if until and int(until)<now():
+        with conn() as c: c.execute("DELETE FROM settings WHERE key='global_maintenance'")
+        return False
+    return True
+
 def maintenance_active(name: str | None) -> bool:
     if not name: return False
     with conn() as c:
@@ -843,7 +907,13 @@ async def decision_for_security(source: str, severity: str, name: str | None, me
         return {'risk':'low','score':0,'action':'maintenance-record','executed':False,'sources':[source],'maintenance':True}
     d=await correlate_security(name, source.lower(), severity.lower(), message)
     iid=upsert_incident(name,d,source,message)
-    if iid: d['incident_id']=iid
+    if iid:
+        d['incident_id']=iid
+        if AUTO_SAFE_PLAYBOOKS and PLAYBOOKS_ENABLED and not global_maintenance_active():
+            with conn() as c:
+                recent=c.execute('SELECT id FROM playbook_runs WHERE incident_id=? AND created_ts>? ORDER BY id DESC LIMIT 1',(iid,now()-600)).fetchone()
+            if not recent:
+                asyncio.create_task(run_safe_playbook(iid,f'Bearer {API_TOKEN}'))
     return d
 
 
@@ -862,6 +932,40 @@ async def health():
     r = await docker("GET", "/_ping")
     return {"ok": r.status_code == 200, "version": VERSION, "docker": r.text.strip() if r.status_code == 200 else "down"}
 
+
+@app.get("/ready")
+async def ready():
+    checks={}
+    try:
+        r=await docker("GET","/_ping"); checks['docker']=r.status_code==200
+    except Exception: checks['docker']=False
+    try:
+        with conn() as c: checks['database']=c.execute("PRAGMA quick_check").fetchone()[0]=='ok'; checks['schema']=int(c.execute("SELECT value FROM settings WHERE key='schema_version'").fetchone()[0])==SCHEMA_VERSION
+    except Exception: checks['database']=False; checks['schema']=False
+    ok=all(checks.values()); return {'ok':ok,'version':VERSION,'checks':checks}
+
+POLICY_PRESETS={
+ 'test':{'criticality':'normal','update_ring':1,'auto_update':0,'auto_isolate':0,'allow_rebuild':1,'protected':0,'require_backup':0},
+ 'user-app':{'criticality':'normal','update_ring':2,'auto_update':0,'auto_isolate':0,'allow_rebuild':1,'protected':0,'require_backup':1},
+ 'important':{'criticality':'high','update_ring':3,'auto_update':0,'auto_isolate':0,'allow_rebuild':1,'protected':0,'require_backup':1},
+ 'database':{'criticality':'critical','update_ring':4,'auto_update':0,'auto_isolate':0,'allow_rebuild':0,'protected':1,'require_backup':1},
+ 'security':{'criticality':'critical','update_ring':4,'auto_update':0,'auto_isolate':0,'allow_rebuild':0,'protected':1,'require_backup':1},
+ 'honeypot':{'criticality':'normal','update_ring':2,'auto_update':0,'auto_isolate':0,'allow_rebuild':1,'protected':0,'require_backup':1},
+}
+
+@app.get('/api/policies/presets')
+async def policy_presets(authorization: str|None=Header(default=None)):
+    require_token(authorization); return POLICY_PRESETS
+
+@app.post('/api/policies/{name}/preset/{preset}')
+async def apply_policy_preset(name: str,preset: str,authorization: str|None=Header(default=None)):
+    require_token(authorization)
+    if preset not in POLICY_PRESETS: raise HTTPException(404,'Unknown policy preset')
+    d=POLICY_PRESETS[preset]; current=default_policy(name); current.update(d)
+    with conn() as c:
+        c.execute("UPDATE policies SET auto_update=?,auto_isolate=?,allow_rebuild=?,protected=?,criticality=?,update_ring=?,require_backup=? WHERE container_name=?",(int(current['auto_update']),int(current['auto_isolate']),int(current['allow_rebuild']),int(current['protected']),current['criticality'],int(current['update_ring']),int(current['require_backup']),name))
+    audit('policy-preset',name,'success',{'preset':preset}) if 'audit' in globals() else event('policy',name,{'preset':preset})
+    return default_policy(name)
 
 @app.get("/api/overview")
 async def overview(authorization: str | None = Header(default=None)):
@@ -918,7 +1022,7 @@ async def manual_sample(name: str, authorization: str | None = Header(default=No
 async def set_policy(name: str, request: Request, authorization: str | None = Header(default=None)):
     require_token(authorization)
     data = await request.json()
-    allowed = {"auto_restart", "auto_update", "auto_isolate", "allow_rebuild", "protected", "idle_cpu", "idle_minutes"}
+    allowed = {"auto_restart", "auto_update", "auto_isolate", "allow_rebuild", "protected", "idle_cpu", "idle_minutes", "criticality", "update_ring", "require_backup"}
     current = default_policy(name)
     for k, v in data.items():
         if k in allowed:
@@ -927,6 +1031,7 @@ async def set_policy(name: str, request: Request, authorization: str | None = He
         c.execute("""UPDATE policies SET auto_restart=?,auto_update=?,auto_isolate=?,allow_rebuild=?,protected=?,idle_cpu=?,idle_minutes=? WHERE container_name=?""",
                   (int(bool(current["auto_restart"])), int(bool(current["auto_update"])), int(bool(current["auto_isolate"])),
                    int(bool(current["allow_rebuild"])), int(bool(current["protected"])), float(current["idle_cpu"]), int(current["idle_minutes"]), name))
+        c.execute("UPDATE policies SET criticality=?,update_ring=?,require_backup=? WHERE container_name=?",(str(current.get("criticality","normal")),max(1,min(4,int(current.get("update_ring",2)))),int(bool(current.get("require_backup",1))),name))
     event("policy", name, data)
     return default_policy(name)
 
@@ -995,38 +1100,99 @@ async def check_update(name: str, authorization: str | None = Header(default=Non
     return result
 
 
+
+async def _probe_clamav() -> dict:
+    """Protocol-level clamd liveness check. TCP-open alone is not considered healthy."""
+    started=time.monotonic()
+    out={"configured":bool(CLAMAV_HOST),"endpoint":f"{CLAMAV_HOST}:{CLAMAV_PORT}"}
+    if not CLAMAV_HOST:
+        return {**out,"status":"not configured","detail":"CLAMAV_HOST is empty"}
+    writer=None
+    try:
+        reader,writer=await asyncio.wait_for(asyncio.open_connection(CLAMAV_HOST,CLAMAV_PORT),timeout=3)
+        writer.write(b"zPING\0"); await writer.drain()
+        resp=await asyncio.wait_for(reader.read(64),timeout=3)
+        clean=resp.strip(b"\x00\r\n ")
+        out.update({"reachable":True,"response":clean.decode(errors="replace"),"latency_ms":round((time.monotonic()-started)*1000)})
+        if clean.upper()==b"PONG":
+            out["status"]="ok"; out["detail"]="clamd protocol PING/PONG verified"
+        else:
+            out["status"]="down"; out["detail"]="Unexpected clamd response: "+repr(resp[:64])
+    except Exception as e:
+        out.update({"status":"down","detail":f"{type(e).__name__}: {e}","latency_ms":round((time.monotonic()-started)*1000)})
+    finally:
+        if writer is not None:
+            try:
+                writer.close(); await writer.wait_closed()
+            except Exception: pass
+    return out
+
+async def _probe_crowdsec() -> dict:
+    started=time.monotonic(); out={"configured":bool(CROWDSEC_URL)}
+    if not CROWDSEC_URL: return {**out,"status":"not configured","detail":"CROWDSEC_URL is empty"}
+    try:
+        async with httpx.AsyncClient(timeout=3,verify=False) as client:
+            h={"X-Api-Key":CROWDSEC_API_KEY} if CROWDSEC_API_KEY else {}
+            r=await client.get(CROWDSEC_URL.rstrip("/")+"/v1/decisions",headers=h)
+        out.update({"http":r.status_code,"latency_ms":round((time.monotonic()-started)*1000)})
+        if 200 <= r.status_code < 300:
+            out.update({"status":"ok","detail":"Authenticated Local API decisions endpoint reachable"})
+        else:
+            out.update({"status":"down","detail":f"CrowdSec API returned HTTP {r.status_code}"})
+    except Exception as e: out.update({"status":"down","detail":f"{type(e).__name__}: {e}"})
+    return out
+
+async def _probe_falco() -> dict:
+    started=time.monotonic(); out={"configured":True,"endpoint":f"{FALCO_HOST}:{FALCO_HEALTH_PORT}"}; writer=None
+    try:
+        reader,writer=await asyncio.wait_for(asyncio.open_connection(FALCO_HOST,FALCO_HEALTH_PORT),timeout=2)
+        out.update({"status":"ok","detail":"Falco private health listener reachable","latency_ms":round((time.monotonic()-started)*1000)})
+    except Exception as e: out.update({"status":"down","detail":f"{type(e).__name__}: {e}"})
+    finally:
+        if writer is not None:
+            try: writer.close(); await writer.wait_closed()
+            except Exception: pass
+    return out
+
+async def _probe_trivy() -> dict:
+    started=time.monotonic(); out={"configured":True}
+    try:
+        code,version_out=await trivy_exec(["trivy","--version"],timeout=30)
+        out.update({"status":"ok" if code==0 else "down","detail":version_out.strip()[-500:],"latency_ms":round((time.monotonic()-started)*1000)})
+    except Exception as e: out.update({"status":"down","detail":f"{type(e).__name__}: {e}"})
+    return out
+
+async def _fresh_sensor_snapshot(record: bool=False) -> dict[str,dict]:
+    vals=await asyncio.gather(_probe_clamav(),_probe_crowdsec(),_probe_falco(),_probe_trivy())
+    result=dict(zip(("clamav","crowdsec","falco","trivy"),vals))
+    if record:
+        t=now()
+        with conn() as c:
+            for name,d in result.items():
+                c.execute("INSERT INTO sensor_health_history(ts,sensor,status,detail,latency_ms) VALUES(?,?,?,?,?)",(t,name,str(d.get('status') or 'unknown'),str(d.get('detail') or '')[:2000],d.get('latency_ms')))
+    return result
+
+@app.get("/api/security/sensors/{sensor}/diagnostics")
+async def sensor_diagnostics(sensor: str, authorization: str | None = Header(default=None)):
+    require_token(authorization); sensor=sensor.lower()
+    if sensor not in {"clamav","crowdsec","falco","trivy"}: raise HTTPException(404,"Unknown sensor")
+    snap=await _fresh_sensor_snapshot(record=True)
+    with conn() as c:
+        hist=rowdicts(c.execute("SELECT ts,status,detail,latency_ms FROM sensor_health_history WHERE sensor=? ORDER BY id DESC LIMIT 12",(sensor,)).fetchall())
+    return {"sensor":sensor,"current":snap[sensor],"history":hist,"failure_grace_seconds":SENSOR_FAILURE_GRACE_SECONDS}
+
 @app.get("/api/integrations")
 async def integrations(authorization: str | None = Header(default=None)):
     require_token(authorization)
+    sensor_health=await _fresh_sensor_snapshot(record=False)
     result = {
-        "clamav": {"configured": bool(CLAMAV_HOST)},
-        "crowdsec": {"configured": bool(CROWDSEC_URL)},
-        "falco": {"configured": True},
-        "trivy": {"configured": True},
+        "clamav": dict(sensor_health["clamav"]),
+        "crowdsec": dict(sensor_health["crowdsec"]),
+        "falco": dict(sensor_health["falco"]),
+        "trivy": dict(sensor_health["trivy"]),
         "discord": {"configured": bool(DISCORD_WEBHOOK)},
         "n8n": {"configured": bool(N8N_WEBHOOK)},
     }
-    try:
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(CLAMAV_HOST, CLAMAV_PORT), timeout=3)
-        # clamd's canonical wire protocol is zPING\0. Some builds also accept PING\n.
-        writer.write(b"zPING\0"); await writer.drain()
-        resp = await asyncio.wait_for(reader.read(64), timeout=3)
-        writer.close(); await writer.wait_closed()
-        result["clamav"]["reachable"] = True
-        result["clamav"]["response"] = resp.decode(errors="replace").strip("\x00\r\n")
-        result["clamav"]["status"] = "ok" if b"PONG" in resp.upper() else "degraded"
-    except Exception as e:
-        result["clamav"]["status"] = "down"; result["clamav"]["detail"] = str(e)
-    if CROWDSEC_URL:
-        try:
-            async with httpx.AsyncClient(timeout=3, verify=False) as client:
-                h = {"X-Api-Key": CROWDSEC_API_KEY} if CROWDSEC_API_KEY else {}
-                r = await client.get(CROWDSEC_URL.rstrip("/") + "/v1/decisions", headers=h)
-                result["crowdsec"]["status"] = "ok" if 200 <= r.status_code < 300 else "down"
-                result["crowdsec"]["http"] = r.status_code
-        except Exception as e:
-            result["crowdsec"]["status"] = "down"; result["crowdsec"]["detail"] = str(e)
-
     with conn() as c:
         f = c.execute("SELECT ts,severity,container_name,message FROM security_events WHERE source='falco' ORDER BY id DESC LIMIT 1").fetchone()
         counts = c.execute("SELECT severity,count(*) n FROM security_events WHERE source='falco' AND ts>? GROUP BY severity", (now()-86400,)).fetchall()
@@ -1037,24 +1203,6 @@ async def integrations(authorization: str | None = Header(default=None)):
         result["falco"]["last_event_age_seconds"] = max(0, now() - int(f["ts"]))
         result["falco"]["last_container"] = f["container_name"]
         result["falco"]["last_severity"] = f["severity"]
-    # Falco health is sensor liveness, not alert frequency. A quiet sensor is healthy.
-    try:
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(FALCO_HOST, FALCO_HEALTH_PORT), timeout=2)
-        writer.close(); await writer.wait_closed()
-        result["falco"]["status"] = "ok"
-        result["falco"]["detail"] = f"sensor reachable at {FALCO_HOST}:{FALCO_HEALTH_PORT}"
-    except Exception as e:
-        result["falco"]["status"] = "down"
-        result["falco"]["detail"] = str(e)
-
-    # Trivy is considered OK only when the runner itself responds. Scan history is reported separately.
-    try:
-        code, version_out = await trivy_exec(["trivy", "--version"], timeout=30)
-        result["trivy"]["status"] = "ok" if code == 0 else "down"
-        result["trivy"]["detail"] = version_out.strip()[-500:]
-    except Exception as e:
-        result["trivy"]["status"] = "down"
-        result["trivy"]["detail"] = str(e)
     with conn() as c:
         t = c.execute("SELECT ts,container_name,image,status,critical,high,medium FROM scans ORDER BY id DESC LIMIT 1").fetchone()
         tc = c.execute("SELECT count(*) n,coalesce(sum(critical),0) critical,coalesce(sum(high),0) high,coalesce(sum(medium),0) medium FROM scans WHERE ts>?", (now()-86400,)).fetchone()
@@ -1151,52 +1299,8 @@ async def decision_engine_summary(authorization: str | None = Header(default=Non
 
 
 async def core_sensor_health() -> dict[str, dict]:
-    """Return liveness for the four core Kingdom security engines.
-
-    Liveness is intentionally separate from alert frequency: a quiet Falco is
-    healthy when its private health listener is reachable.
-    """
-    result = {
-        "clamav": {"status": "down", "configured": bool(CLAMAV_HOST)},
-        "crowdsec": {"status": "down", "configured": bool(CROWDSEC_URL)},
-        "falco": {"status": "down", "configured": True},
-        "trivy": {"status": "down", "configured": True},
-    }
-    try:
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(CLAMAV_HOST, CLAMAV_PORT), timeout=3)
-        # clamd's canonical wire protocol is zPING\0. Some builds also accept PING\n.
-        writer.write(b"zPING\0"); await writer.drain()
-        resp = await asyncio.wait_for(reader.read(64), timeout=3)
-        writer.close(); await writer.wait_closed()
-        result["clamav"]["reachable"] = True
-        result["clamav"]["response"] = resp.decode(errors="replace").strip("\x00\r\n")
-        result["clamav"]["status"] = "ok" if b"PONG" in resp.upper() else "degraded"
-    except Exception as e:
-        result["clamav"]["detail"] = str(e)
-    if CROWDSEC_URL:
-        try:
-            async with httpx.AsyncClient(timeout=3, verify=False) as client:
-                headers = {"X-Api-Key": CROWDSEC_API_KEY} if CROWDSEC_API_KEY else {}
-                r = await client.get(CROWDSEC_URL.rstrip("/") + "/v1/decisions", headers=headers)
-                result["crowdsec"]["status"] = "ok" if 200 <= r.status_code < 300 else "down"
-                result["crowdsec"]["http"] = r.status_code
-        except Exception as e:
-            result["crowdsec"]["detail"] = str(e)
-    else:
-        result["crowdsec"]["status"] = "not configured"
-    try:
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(FALCO_HOST, FALCO_HEALTH_PORT), timeout=2)
-        writer.close(); await writer.wait_closed()
-        result["falco"]["status"] = "ok"
-    except Exception as e:
-        result["falco"]["detail"] = str(e)
-    try:
-        code, version_out = await trivy_exec(["trivy", "--version"], timeout=30)
-        result["trivy"]["status"] = "ok" if code == 0 else "down"
-        result["trivy"]["detail"] = version_out.strip()[-500:]
-    except Exception as e:
-        result["trivy"]["detail"] = str(e)
-    return result
+    """Single canonical live health snapshot used by scoring and UI engine state."""
+    return await _fresh_sensor_snapshot(record=True)
 
 
 @app.get("/api/security/score")
@@ -1296,7 +1400,11 @@ async def security_score(authorization: str | None = Header(default=None)):
     sensor_penalties = {"falco": 12, "clamav": 10, "crowdsec": 9, "trivy": 8}
     unavailable = [name for name, data in sensor_health.items() if data.get("status") != "ok"]
     confidence_penalty = sum(sensor_penalties.get(name, 5) for name in unavailable)
-    server_score=max(0, server_score-confidence_penalty)
+    # v3 canonical overall score: weighted independent posture dimensions. Sensor outages
+    # affect Monitoring once, avoiding the previous double-penalty problem.
+    dimensions=_risk_dimensions(leaderboard,sensor_health,latest_scan,containers)
+    server_score=round(dimensions['threat']*0.35 + dimensions['vulnerability']*0.20 + dimensions['exposure']*0.15 + dimensions['monitoring']*0.20 + dimensions['trust']*0.10)
+    server_score=max(0,min(100,server_score))
 
     if server_score>=90: mood,status,risk='excellent','EXCELLENT','LOW'
     elif server_score>=75: mood,status,risk='good','GOOD','LOW'
@@ -1305,56 +1413,58 @@ async def security_score(authorization: str | None = Header(default=None)):
     else: mood,status,risk='critical','CRITICAL','CRITICAL'
     if unavailable and server_score>=55:
         status='MONITORING DEGRADED'
-    dimensions=_risk_dimensions(leaderboard,sensor_health,latest_scan,containers)
     return {'score':server_score,'mood':mood,'status':status,'overall_risk':risk,'severity_counts':severity_counts,
             'immediate_attention':immediate[:6],'leaderboard':leaderboard[:12],'suppressed_24h':sup,'evaluated_ts':t,
             'sensor_health':sensor_health,'unavailable_sensors':unavailable,'monitoring_confidence':max(0,100-confidence_penalty),
-            'dimensions':dimensions,'risk_model':'kingdom-2.0-multidimensional'}
+            'dimensions':dimensions,'dimension_weights':{'threat':35,'vulnerability':20,'exposure':15,'monitoring':20,'trust':10},'risk_model':'kingdom-3.0-five-dimension-v2'}
 
 
 
 def _risk_dimensions(leaderboard: list[dict], sensor_health: dict, latest_scan: dict, containers: list[dict]) -> dict:
-    """Kingdom 2.0 multidimensional posture model. Each dimension is 0..100 where 100 is best."""
-    risks=[int(x.get('risk') or 0) for x in leaderboard]
-    threat=max(0,100-(max(risks) if risks else 0))
+    """Five independent 0..100 posture dimensions. Avoids double-counting event volume."""
+    risks=sorted((int(x.get('risk') or 0) for x in leaderboard),reverse=True)
+    threat=max(0,100-round((risks[0] if risks else 0)*0.75 + (risks[1] if len(risks)>1 else 0)*0.15))
     vuln_penalty=0
     for sc in latest_scan.values():
-        vuln_penalty=max(vuln_penalty,min(100,int(sc.get('critical') or 0)*18+int(sc.get('high') or 0)*6+min(20,int(sc.get('medium') or 0))))
+        vuln_penalty=max(vuln_penalty,min(100,int(sc.get('critical') or 0)*20+int(sc.get('high') or 0)*7+min(20,int(sc.get('medium') or 0))))
     vulnerability=max(0,100-vuln_penalty)
-    bad=sum(1 for x in sensor_health.values() if x.get('status')!='ok')
-    monitoring=max(0,100-bad*22)
-    # Exposure is policy/readiness based, not a claim that a network is Internet-exposed.
-    weak=0
-    for c in containers:
-        pol=c.get('policy') or {}
-        if not pol.get('protected') and not pol.get('allow_rebuild'): weak+=1
-    exposure=max(0,100-min(45,weak*2))
-    known=sum(1 for x in leaderboard if int(x.get('score') or 0)>=75)
-    trust=round(100*known/max(1,len(leaderboard)))
-    return {'threat':threat,'vulnerability':vulnerability,'exposure':exposure,'monitoring':monitoring,'trust':trust}
+    weights={'falco':25,'clamav':25,'crowdsec':25,'trivy':25}
+    monitoring=max(0,100-sum(weights.get(k,10) for k,v in sensor_health.items() if v.get('status')!='ok'))
+    # Exposure uses actual published host ports plus high-risk Docker configuration indicators available in summary metadata.
+    published=sum(1 for c in containers for p in (c.get('ports') or []) if p.get('PublicPort') is not None)
+    core_published=sum(1 for c in containers if risk_profile(c.get('name','')).get('profile') in {'database','security','critical-infrastructure'} for p in (c.get('ports') or []) if p.get('PublicPort') is not None)
+    exposure=max(0,100-min(70,published*2+core_published*8))
+    # Trust measures how much current risk has explicit/scoped evidence handling, not general container health.
+    active_risk=[x for x in leaderboard if int(x.get('risk') or 0)>0]
+    explained=sum(1 for x in active_risk if any(('Known-good approval' in f or 'Adaptive baseline' in f or 'Trivy:' in f) for f in x.get('factors',[])))
+    trust=100 if not active_risk else round(70+30*explained/max(1,len(active_risk)))
+    return {'threat':threat,'vulnerability':vulnerability,'exposure':exposure,'monitoring':monitoring,'trust':min(100,trust),
+            'evidence':{'published_ports':published,'core_published_ports':core_published,'active_risk_containers':len(active_risk),'explained_risk_containers':explained}}
 
 def _playbook_for_incident(inc: dict, investigation: dict | None=None) -> dict:
     sources=set(_safe_json(inc.get('sources_json'),[]) or [])
     sev=str(inc.get('severity') or 'low').lower(); name=inc.get('container_name') or 'host'
     inv=investigation or {}; classification=str(inv.get('classification') or '').lower()
     steps=[]
-    def add(key,title,gate='operator',destructive=False): steps.append({'key':key,'title':title,'gate':gate,'destructive':destructive})
-    add('capture','Capture evidence','automatic')
-    if name!='host': add('scan','Run/refresh Trivy scan','automatic')
-    if 'clamav' in sources: add('quarantine','Preserve/quarantine malware evidence','operator')
-    if len(sources)>=2 or sev in {'critical','high'}: add('isolate','Isolate container from production networks','policy')
-    if classification in {'likely expected','expected'}: add('baseline','Review exact rule and mark expected if recognized','operator')
-    else: add('investigate','Review process, image, network and corroboration evidence','operator')
-    if name!='host': add('recover','Create controlled rebuild plan','approval',True)
-    add('observe','Post-recovery observation and health verification','automatic')
+    def add(key,title,gate='operator',destructive=False,auto=False):
+        steps.append({'key':key,'title':title,'gate':gate,'destructive':destructive,'auto_eligible':auto})
+    add('capture','Capture immutable incident/container evidence','automatic',False,PLAYBOOK_AUTO_EVIDENCE)
+    if name!='host': add('scan','Refresh Trivy image verification','automatic',False,PLAYBOOK_AUTO_SCAN)
+    add('correlate','Recalculate Falco / Trivy / ClamAV / CrowdSec corroboration','automatic',False,True)
+    if 'clamav' in sources: add('malware-review','Preserve malware/quarantine evidence','operator')
+    if len(sources)>=2 or sev in {'critical','high'}: add('isolate','Isolate container from production networks','policy',False,PLAYBOOK_AUTO_ISOLATE)
+    if classification in {'likely-expected','expected','likely expected'}: add('baseline','Review exact Falco rule and scoped known-good approval','operator')
+    else: add('investigate','Review processes, image, network and corroboration evidence','operator')
+    if name!='host': add('recover','Prepare controlled rebuild plan','approval',True,PLAYBOOK_AUTO_RECOVER)
+    add('observe','Post-action health and sensor observation','automatic',False,True)
     add('resolve','Resolve incident with audit note','operator')
-    return {'name':'Kingdom 2.0 adaptive response','container':name,'severity':sev,'sources':sorted(sources),'steps':steps,'destructive_actions_require_approval':True}
+    return {'name':'Kingdom 2.1 adaptive response','enabled':PLAYBOOKS_ENABLED,'container':name,'severity':sev,'sources':sorted(sources),'classification':classification,'steps':steps,'destructive_actions_require_approval':True,'safe_auto_steps':[x['key'] for x in steps if x['auto_eligible'] and not x['destructive'] and x['key'] in {'capture','scan','correlate','observe'}]}
 
 @app.get("/api/security/posture")
 async def security_posture(authorization: str | None = Header(default=None)):
     require_token(authorization)
     score=await security_score(authorization)
-    return {'version':VERSION,'score':score['score'],'dimensions':score.get('dimensions',{}),'sensor_health':score.get('sensor_health',{}),'recovery_model':'evidence-gated','policy_model':'per-container + risk-profile','automation_boundary':'destructive recovery requires explicit approval'}
+    return {'version':VERSION,'score':score['score'],'dimensions':score.get('dimensions',{}),'sensor_health':score.get('sensor_health',{}),'recovery_model':'evidence-gated','policy_model':'per-container + risk-profile','automation_boundary':'safe playbook steps may run automatically; destructive recovery requires explicit approval','playbooks':{'enabled':PLAYBOOKS_ENABLED,'auto_evidence':PLAYBOOK_AUTO_EVIDENCE,'auto_scan':PLAYBOOK_AUTO_SCAN,'auto_isolate':PLAYBOOK_AUTO_ISOLATE,'auto_recover':PLAYBOOK_AUTO_RECOVER}}
 
 @app.get("/api/incidents/{incident_id}/playbook")
 async def incident_playbook(incident_id: int, authorization: str | None = Header(default=None)):
@@ -1364,6 +1474,51 @@ async def incident_playbook(incident_id: int, authorization: str | None = Header
     if not r: raise HTTPException(404,'Incident not found')
     inv=await build_incident_investigation(incident_id,persist=False)
     return _playbook_for_incident(dict(r),inv)
+
+@app.post("/api/incidents/{incident_id}/playbook/run-safe")
+async def run_safe_playbook(incident_id: int, authorization: str | None = Header(default=None)):
+    require_token(authorization)
+    if not PLAYBOOKS_ENABLED: raise HTTPException(409,'Playbooks are disabled')
+    with conn() as c: inc=c.execute("SELECT * FROM incidents WHERE id=?",(incident_id,)).fetchone()
+    if not inc: raise HTTPException(404,'Incident not found')
+    inv=await build_incident_investigation(incident_id,persist=False); plan=_playbook_for_incident(dict(inc),inv)
+    t=now()
+    with conn() as c:
+        cur=c.execute("INSERT INTO playbook_runs(incident_id,created_ts,status,plan_json,result_json) VALUES(?,?,?,?,?)",(incident_id,t,'running',json.dumps(plan),json.dumps({})))
+        run_id=cur.lastrowid
+    result={'run_id':run_id,'incident_id':incident_id,'completed':[],'skipped':[],'errors':[]}
+    name=inc['container_name']
+    try:
+        if PLAYBOOK_AUTO_EVIDENCE:
+            try: result['evidence']=await capture_incident_evidence(incident_id,f"Bearer {API_TOKEN}"); result['completed'].append('capture')
+            except Exception as e: result['errors'].append('capture: '+str(e))
+        else: result['skipped'].append('capture')
+        # capture_incident_evidence already runs Trivy for containers; only run a separate scan when evidence capture is disabled.
+        if name and PLAYBOOK_AUTO_SCAN and not PLAYBOOK_AUTO_EVIDENCE:
+            try: result['scan']=await trivy_scan(name); result['completed'].append('scan')
+            except Exception as e: result['errors'].append('scan: '+str(e))
+        elif name and PLAYBOOK_AUTO_SCAN: result['completed'].append('scan')
+        elif name: result['skipped'].append('scan')
+        result['assessment']=await build_incident_investigation(incident_id,True); result['completed'].append('correlate')
+        result['sensor_health']=await core_sensor_health(); result['completed'].append('observe')
+        result['requires_operator']=[x for x in plan['steps'] if x['gate'] in {'operator','policy','approval'}]
+        status='completed-with-warnings' if result['errors'] else 'completed'
+        with conn() as c: c.execute("UPDATE playbook_runs SET completed_ts=?,status=?,result_json=? WHERE id=?",(now(),status,json.dumps(result,default=str),run_id))
+        event('playbook',name or 'host',{'run_id':run_id,'incident_id':incident_id,'status':status,'completed':result['completed'],'errors':result['errors']},'warning' if result['errors'] else 'info')
+        return {'ok':not bool(result['errors']),'status':status,'plan':plan,**result}
+    except Exception as e:
+        result['errors'].append(str(e))
+        with conn() as c: c.execute("UPDATE playbook_runs SET completed_ts=?,status='failed',result_json=? WHERE id=?",(now(),json.dumps(result,default=str),run_id))
+        raise HTTPException(500,result)
+
+@app.get("/api/incidents/{incident_id}/playbook/runs")
+async def playbook_run_history(incident_id: int, authorization: str | None = Header(default=None)):
+    require_token(authorization)
+    with conn() as c: rows=c.execute("SELECT id,created_ts,completed_ts,status,plan_json,result_json FROM playbook_runs WHERE incident_id=? ORDER BY id DESC LIMIT 20",(incident_id,)).fetchall()
+    out=[]
+    for r in rows:
+        d=dict(r); d['plan']=_safe_json(d.pop('plan_json'),{}); d['result']=_safe_json(d.pop('result_json'),{}); out.append(d)
+    return out
 
 def suppression_diagnostics_data() -> list[dict]:
     t=now(); cutoff=t-86400; out=[]
@@ -1798,6 +1953,381 @@ async def approve_recovery(plan_id: int, authorization: str | None = Header(defa
         recovery_step(plan_id,'recovery','failed',str(e)); event('recovery_failed',name,{'plan_id':plan_id,**result},'critical')
         raise HTTPException(500,result)
 
+
+
+def audit(action: str, subject: str, outcome: str, detail: Any=None, actor: str='kingdom') -> None:
+    with conn() as c:
+        c.execute("INSERT INTO audit_log(ts,actor,action,subject,outcome,detail) VALUES(?,?,?,?,?,?)",(now(),actor,action,subject,outcome,json.dumps(detail or {},default=str)[:100000]))
+
+async def _capture_portainer_compose() -> tuple[str|None,str|None]:
+    if COMPOSE_SNAPSHOT_PATH:
+        try:
+            q=Path(COMPOSE_SNAPSHOT_PATH)
+            if q.exists() and q.is_file(): return q.read_text(errors='replace')[:500000],f'file:{q}'
+        except Exception: pass
+    if PORTAINER_URL and PORTAINER_API_KEY and PORTAINER_STACK_ID:
+        try:
+            async with httpx.AsyncClient(timeout=15,verify=False) as client:
+                r=await client.get(f"{PORTAINER_URL}/api/stacks/{PORTAINER_STACK_ID}/file",headers={'X-API-Key':PORTAINER_API_KEY})
+                if r.status_code==200:
+                    data=r.json(); text=data.get('StackFileContent') if isinstance(data,dict) else None
+                    if text: return str(text)[:500000],f'portainer-stack:{PORTAINER_STACK_ID}'
+        except Exception as e: event('portainer_snapshot','host',str(e),'warning')
+    return None,None
+
+async def capture_config_snapshot(name: str, reason: str) -> dict:
+    obj=await inspect_container(name); cfg=obj.get('Config') or {}; nets=(obj.get('NetworkSettings') or {}).get('Networks') or {}
+    compose,source=await _capture_portainer_compose()
+    with conn() as c:
+        cur=c.execute("INSERT INTO config_snapshots(ts,container_name,reason,image_ref,image_id,inspect_json,compose_text,compose_source,env_json,labels_json,networks_json,verified) VALUES(?,?,?,?,?,?,?,?,?,?,?,1)",
+          (now(),name,reason,cfg.get('Image'),obj.get('Image'),json.dumps(obj,default=str),compose,source,json.dumps(cfg.get('Env') or []),json.dumps(cfg.get('Labels') or {}),json.dumps(nets,default=str)))
+        sid=cur.lastrowid
+        # Retention is per container, but never delete snapshots referenced by an active update plan.
+        old=c.execute("SELECT id FROM config_snapshots WHERE container_name=? ORDER BY id DESC LIMIT -1 OFFSET ?",(name,max(1,ROLLBACK_RETENTION))).fetchall()
+        for r in old: c.execute("DELETE FROM config_snapshots WHERE id=? AND id NOT IN (SELECT COALESCE(snapshot_id,-1) FROM update_plans UNION SELECT COALESCE(rollback_snapshot_id,-1) FROM update_plans)",(r['id'],))
+    audit('snapshot',name,'success',{'snapshot_id':sid,'image_id':obj.get('Image'),'compose_source':source})
+    return {'snapshot_id':sid,'image_ref':cfg.get('Image'),'image_id':obj.get('Image'),'compose_saved':bool(compose),'compose_source':source}
+
+async def _recreate_from_inspect(name: str, obj: dict, image_override: str|None=None, quarantine: bool=False) -> dict:
+    cfg=dict(obj.get('Config') or {}); hc=dict(obj.get('HostConfig') or {}); nets=(obj.get('NetworkSettings') or {}).get('Networks') or {}
+    if image_override: cfg['Image']=image_override
+    # Docker inspect includes read-only/result fields not accepted by create; Config+HostConfig are the stable recreation source.
+    if quarantine:
+        await ensure_quarantine_network(); hc.pop('PortBindings',None); hc['NetworkMode']=QUARANTINE_NETWORK; endpoints={QUARANTINE_NETWORK:{}}
+    else:
+        endpoints={k:{'Aliases':v.get('Aliases'),'IPAMConfig':v.get('IPAMConfig')} for k,v in nets.items() if k!=QUARANTINE_NETWORK}
+    cfg['HostConfig']=hc; cfg['NetworkingConfig']={'EndpointsConfig':endpoints}
+    await recovery_docker('POST',f"/containers/{quote(name,safe='')}/stop?t=20")
+    rr=await recovery_docker('DELETE',f"/containers/{quote(name,safe='')}?force=1")
+    if rr.status_code not in (204,404): raise RuntimeError('remove failed: '+rr.text[:500])
+    cr=await recovery_docker('POST',f"/containers/create?name={quote(name,safe='')}",json=cfg)
+    if cr.status_code!=201: raise RuntimeError('create failed: '+cr.text[:1000])
+    sr=await recovery_docker('POST',f"/containers/{quote(name,safe='')}/start")
+    if sr.status_code not in (204,304): raise RuntimeError('start failed: '+sr.text[:500])
+    await asyncio.sleep(max(5,min(UPDATE_OBSERVATION_SECONDS,30)))
+    state=await recovery_container_state(name)
+    if not state.get('running') or state.get('health')=='unhealthy': raise RuntimeError('replacement failed health observation: '+json.dumps(state))
+    return state
+
+@app.post('/api/updates/{name}/check')
+async def update_check(name: str, authorization: str|None=Header(default=None)):
+    require_token(authorization); obj=await inspect_container(name); image=(obj.get('Config') or {}).get('Image'); old_id=obj.get('Image')
+    if not image: raise HTTPException(409,'Container has no image reference')
+    # Capture BEFORE pull so rollback retains immutable old image ID and complete runtime config.
+    snap=await capture_config_snapshot(name,'pre-update-check')
+    pulled=await pull_image(image); candidate=pulled.get('after')
+    status='available' if candidate and candidate!=old_id else 'current'
+    with conn() as c:
+        cur=c.execute("INSERT INTO update_plans(created_ts,container_name,status,snapshot_id,image_ref,old_image_id,candidate_image_id,result_json,rollback_snapshot_id) VALUES(?,?,?,?,?,?,?,?,?)",
+          (now(),name,status,snap['snapshot_id'],image,old_id,candidate,json.dumps({'pull':pulled}),snap['snapshot_id']))
+    audit('update-check',name,'success',{'plan_id':cur.lastrowid,'status':status,'old':old_id,'candidate':candidate})
+    if status=='available' and DISCORD_NOTIFY_UPDATES:
+        await notify('Update available',f'{name}: candidate image detected and rollback snapshot #{snap["snapshot_id"]} captured. Verify in Update Center before applying.','info',force=True)
+    return {'plan_id':cur.lastrowid,'status':status,'old_image_id':old_id,'candidate_image_id':candidate,'rollback_snapshot':snap}
+
+@app.post('/api/updates/{plan_id}/verify')
+async def update_verify(plan_id: int, authorization: str|None=Header(default=None)):
+    require_token(authorization)
+    with conn() as c: p=c.execute('SELECT * FROM update_plans WHERE id=?',(plan_id,)).fetchone()
+    if not p: raise HTTPException(404,'Update plan not found')
+    if p['status']=='current': return {'ok':True,'status':'current','plan_id':plan_id}
+    tri=await trivy_scan(p['container_name']) if UPDATE_REQUIRE_TRIVY else {'status':'skipped','critical':0,'high':0}
+    blocked=(str(tri.get('status')) not in {'ok','skipped'} or (UPDATE_BLOCK_CRITICAL and int(tri.get('critical',0) or 0)>0) or (UPDATE_BLOCK_HIGH and int(tri.get('high',0) or 0)>0))
+    status='blocked' if blocked else 'verified'
+    with conn() as c: c.execute('UPDATE update_plans SET status=?,scan_json=? WHERE id=?',(status,json.dumps(tri,default=str),plan_id))
+    audit('update-verify',p['container_name'],status,{'plan_id':plan_id,'trivy':tri})
+    return {'ok':not blocked,'status':status,'plan_id':plan_id,'trivy':tri}
+
+@app.post('/api/updates/{plan_id}/apply')
+async def update_apply(plan_id: int, authorization: str|None=Header(default=None)):
+    require_token(authorization)
+    with conn() as c: p=c.execute('SELECT * FROM update_plans WHERE id=?',(plan_id,)).fetchone()
+    if not p: raise HTTPException(404,'Update plan not found')
+    name=p['container_name']; pol=default_policy(name)
+    if pol.get('protected'): raise HTTPException(409,'Protected container cannot be auto-updated')
+    if risk_profile(name).get('profile') in {'database','security','critical-infrastructure'} and not p['status']=='verified': raise HTTPException(409,'Critical service update must be verified first')
+    if p['status'] not in {'verified','available'}: raise HTTPException(409,'Update plan is not ready')
+    with conn() as c: snap=c.execute('SELECT * FROM config_snapshots WHERE id=?',(p['snapshot_id'],)).fetchone()
+    if not snap: raise HTTPException(409,'Rollback snapshot missing; update refused')
+    obj=json.loads(snap['inspect_json']); mounts=obj.get('Mounts') or []
+    if mounts and not UPDATE_ALLOW_STATEFUL:
+        raise HTTPException(409,'Stateful container has mounts/volumes. Automatic image rollback cannot reverse data migrations; set KM_UPDATE_ALLOW_STATEFUL=true only after validating application-data backups.')
+    if mounts and UPDATE_ALLOW_STATEFUL and pol.get('require_backup'):
+        with conn() as c: b=c.execute('SELECT verified_ts,provider FROM backup_status WHERE container_name=?',(name,)).fetchone()
+        if not b or now()-int(b['verified_ts'])>BACKUP_MAX_AGE_HOURS*3600:
+            raise HTTPException(409,f'Stateful update requires a verified data backup newer than {BACKUP_MAX_AGE_HOURS}h. Mark backup status in Disaster Recovery before applying.')
+    result={'old_image_id':p['old_image_id'],'candidate_image_id':p['candidate_image_id'],'snapshot_id':p['snapshot_id']}
+    try:
+        state=await _recreate_from_inspect(name,obj,p['candidate_image_id'],False); result['state']=state
+        with conn() as c: c.execute("UPDATE update_plans SET status='completed',approved_ts=?,executed_ts=?,result_json=? WHERE id=?",(now(),now(),json.dumps(result,default=str),plan_id))
+        audit('update-apply',name,'success',{'plan_id':plan_id,**result}); event('update',name,{'plan_id':plan_id,'state':'completed'},'info')
+        if DISCORD_NOTIFY_UPDATES: await notify('Update completed',f'{name} updated successfully. Rollback snapshot #{p["snapshot_id"]} remains available.','info',force=True)
+        return {'ok':True,'plan_id':plan_id,'rollback_available':True,**result}
+    except Exception as e:
+        result['error']=str(e)
+        # Automatic rollback is safer than leaving a failed update in place.
+        try:
+            rb=await _recreate_from_inspect(name,obj,p['old_image_id'],False); result['automatic_rollback']=rb; status='rolled-back'
+        except Exception as re:
+            result['rollback_error']=str(re); status='failed'
+            try: await isolate(name)
+            except Exception: pass
+        with conn() as c: c.execute('UPDATE update_plans SET status=?,executed_ts=?,result_json=? WHERE id=?',(status,now(),json.dumps(result,default=str),plan_id))
+        audit('update-apply',name,status,{'plan_id':plan_id,**result}); raise HTTPException(500,result)
+
+@app.post('/api/updates/{plan_id}/rollback')
+async def update_rollback(plan_id: int, authorization: str|None=Header(default=None)):
+    require_token(authorization)
+    with conn() as c:
+        p=c.execute('SELECT * FROM update_plans WHERE id=?',(plan_id,)).fetchone()
+        snap=c.execute('SELECT * FROM config_snapshots WHERE id=(SELECT rollback_snapshot_id FROM update_plans WHERE id=?)',(plan_id,)).fetchone()
+    if not p or not snap: raise HTTPException(404,'Rollback plan/snapshot not found')
+    obj=json.loads(snap['inspect_json']); state=await _recreate_from_inspect(p['container_name'],obj,p['old_image_id'],False)
+    with conn() as c: c.execute("UPDATE update_plans SET status='rolled-back',executed_ts=?,result_json=? WHERE id=?",(now(),json.dumps({'manual_rollback':state},default=str),plan_id))
+    audit('rollback',p['container_name'],'success',{'plan_id':plan_id,'snapshot_id':snap['id'],'image_id':p['old_image_id']})
+    if DISCORD_NOTIFY_RECOVERY: await notify('Rollback completed',f'{p["container_name"]} restored to immutable image {str(p["old_image_id"])[:24]} from snapshot #{snap["id"]}.','warning',force=True)
+    return {'ok':True,'plan_id':plan_id,'restored_image_id':p['old_image_id'],'snapshot_id':snap['id'],'state':state}
+
+@app.get('/api/updates')
+async def updates_list(authorization: str|None=Header(default=None)):
+    require_token(authorization)
+    with conn() as c: return rowdicts(c.execute('SELECT * FROM update_plans ORDER BY id DESC LIMIT 100').fetchall())
+
+@app.get('/api/rollback/{name}')
+async def rollback_history(name: str, authorization: str|None=Header(default=None)):
+    require_token(authorization)
+    with conn() as c: rows=c.execute('SELECT id,ts,reason,image_ref,image_id,compose_source,verified FROM config_snapshots WHERE container_name=? ORDER BY id DESC LIMIT 20',(name,)).fetchall()
+    return rowdicts(rows)
+
+@app.get('/api/audit')
+async def audit_history(limit: int=100, authorization: str|None=Header(default=None)):
+    require_token(authorization)
+    with conn() as c: return rowdicts(c.execute('SELECT * FROM audit_log ORDER BY id DESC LIMIT ?',(max(1,min(500,limit)),)).fetchall())
+
+@app.get('/api/security/score/validate')
+async def validate_score(authorization: str|None=Header(default=None)):
+    require_token(authorization); ss=await security_score(authorization); dims=ss.get('dimensions') or {}
+    checks=[]
+    def ck(name,ok,detail): checks.append({'check':name,'ok':bool(ok),'detail':detail})
+    ck('score-range',0<=ss['score']<=100,ss['score']); ck('dimension-range',all(0<=v<=100 for k,v in dims.items() if isinstance(v,(int,float))),dims)
+    ck('sensor-consistency',set(ss.get('unavailable_sensors') or [])=={k for k,v in (ss.get('sensor_health') or {}).items() if v.get('status')!='ok'},ss.get('unavailable_sensors'))
+    ck('leaderboard-range',all(0<=x['score']<=100 and 0<=x['risk']<=100 for x in ss.get('leaderboard',[])),'all container scores bounded')
+    return {'ok':all(x['ok'] for x in checks),'checks':checks,'risk_model':ss.get('risk_model'),'score':ss['score'],'dimensions':dims}
+
+async def update_engine_loop():
+    await asyncio.sleep(max(30,UPDATE_START_DELAY_SECONDS))
+    while True:
+        try:
+            if UPDATE_ENGINE_ENABLED and not global_maintenance_active():
+                cs=await list_containers()
+                # Rings reduce blast radius; only explicitly opted-in containers are checked automatically.
+                eligible=[]
+                for x in cs:
+                    pol=default_policy(x['name'])
+                    if pol.get('auto_update') and not pol.get('protected'): eligible.append((int(pol.get('update_ring') or 2),x['name']))
+                for ring,name in sorted(eligible):
+                    try:
+                        plan=await update_check(name,f'Bearer {API_TOKEN}')
+                        if plan.get('status')=='available':
+                            ver=await update_verify(int(plan['plan_id']),f'Bearer {API_TOKEN}')
+                            if UPDATE_AUTO_APPLY and ver.get('ok') and ring<=2:
+                                await update_apply(int(plan['plan_id']),f'Bearer {API_TOKEN}')
+                    except Exception as e: event('update_engine',name,str(e),'warning')
+        except Exception as e: event('update_engine','host',str(e),'warning')
+        await asyncio.sleep(max(3600,UPDATE_CHECK_SECONDS))
+
+
+def _redacted_config(obj: dict) -> dict:
+    cfg=obj.get('Config') or {}; hc=obj.get('HostConfig') or {}; nets=(obj.get('NetworkSettings') or {}).get('Networks') or {}
+    env=cfg.get('Env') or []; env_keys=sorted({str(x).split('=',1)[0] for x in env if '=' in str(x)})
+    mounts=[]
+    for m in obj.get('Mounts') or []:
+        mounts.append({'type':m.get('Type'),'source':m.get('Source'),'destination':m.get('Destination'),'rw':m.get('RW')})
+    ports=hc.get('PortBindings') or {}
+    caps={'add':sorted(hc.get('CapAdd') or []),'drop':sorted(hc.get('CapDrop') or [])}
+    return {
+      'image':cfg.get('Image'),'env_keys':env_keys,'labels':{str(k):hashlib.sha256(str(v).encode()).hexdigest()[:16] for k,v in (cfg.get('Labels') or {}).items()},'user':cfg.get('User') or '',
+      'privileged':bool(hc.get('Privileged')),'network_mode':hc.get('NetworkMode'),'ports':ports,'mounts':sorted(mounts,key=lambda x:(str(x.get('destination')),str(x.get('source')))),
+      'networks':sorted(nets.keys()),'caps':caps,'security_opt':sorted(hc.get('SecurityOpt') or []),'read_only_rootfs':bool(hc.get('ReadonlyRootfs')),
+      'restart_policy':hc.get('RestartPolicy') or {},'pid_mode':hc.get('PidMode') or '', 'ipc_mode':hc.get('IpcMode') or ''
+    }
+
+def _fingerprint(data: dict) -> str:
+    return hashlib.sha256(json.dumps(data,sort_keys=True,separators=(',',':'),default=str).encode()).hexdigest()
+
+def _secret_key_findings(obj: dict) -> list[str]:
+    keys=[]
+    for item in (obj.get('Config') or {}).get('Env') or []:
+        k=str(item).split('=',1)[0]
+        if any(x in k.lower() for x in ('password','passwd','token','secret','api_key','apikey','private_key','access_key')): keys.append(k)
+    return sorted(set(keys))
+
+async def drift_status(name: str) -> dict:
+    obj=await inspect_container(name); current=_redacted_config(obj); fp=_fingerprint(current)
+    with conn() as c: b=c.execute('SELECT * FROM config_baselines WHERE container_name=?',(name,)).fetchone()
+    if not b: return {'container':name,'status':'unbaselined','current_fingerprint':fp,'changes':[],'dangerous':[],'secret_env_keys':_secret_key_findings(obj)}
+    old=_safe_json(b['config_json'],{}) or {}; changes=[]
+    for k in sorted(set(old)|set(current)):
+        if old.get(k)!=current.get(k): changes.append(k)
+    dangerous=[]
+    if not old.get('privileged') and current.get('privileged'): dangerous.append('privileged enabled')
+    if len(current.get('ports') or {})>len(old.get('ports') or {}): dangerous.append('new published port binding')
+    old_mounts={str(x.get('source'))+'>'+str(x.get('destination')) for x in old.get('mounts') or []}; new_mounts={str(x.get('source'))+'>'+str(x.get('destination')) for x in current.get('mounts') or []}
+    added_mounts=new_mounts-old_mounts
+    if any('/var/run/docker.sock' in x for x in added_mounts): dangerous.append('Docker socket mount added')
+    if set(current.get('caps',{}).get('add') or [])-set(old.get('caps',{}).get('add') or []): dangerous.append('Linux capabilities added')
+    return {'container':name,'status':'drift' if changes else 'clean','baseline_ts':b['ts'],'baseline_fingerprint':b['fingerprint'],'current_fingerprint':fp,'changes':changes,'dangerous':dangerous,'secret_env_keys':_secret_key_findings(obj)}
+
+@app.post('/api/drift/{name}/approve')
+async def approve_drift_baseline(name: str, authorization: str|None=Header(default=None)):
+    require_token(authorization); obj=await inspect_container(name); data=_redacted_config(obj); fp=_fingerprint(data)
+    with conn() as c: c.execute("INSERT OR REPLACE INTO config_baselines(container_name,ts,fingerprint,config_json,actor) VALUES(?,?,?,?,?)",(name,now(),fp,json.dumps(data,sort_keys=True),'operator'))
+    audit('drift-baseline',name,'success',{'fingerprint':fp}); return {'ok':True,'container':name,'fingerprint':fp}
+
+@app.get('/api/drift')
+async def drift_all(authorization: str|None=Header(default=None)):
+    require_token(authorization); out=[]
+    for x in await list_containers():
+        try: out.append(await drift_status(x['name']))
+        except Exception as e: out.append({'container':x['name'],'status':'error','error':str(e)})
+    return out
+
+@app.get('/api/drift/{name}')
+async def drift_one(name: str, authorization: str|None=Header(default=None)):
+    require_token(authorization); return await drift_status(name)
+
+async def dependency_graph_data() -> dict:
+    cs=await list_containers(); objs={}
+    for x in cs:
+        try: objs[x['name']]=await inspect_container(x['name'])
+        except Exception: pass
+    nodes=[]; edges=[]
+    netmap={}; volmap={}
+    for name,obj in objs.items():
+        cfg=obj.get('Config') or {}; hc=obj.get('HostConfig') or {}; nets=(obj.get('NetworkSettings') or {}).get('Networks') or {}
+        nodes.append({'id':name,'image':cfg.get('Image'),'profile':risk_profile(name).get('profile'),'protected':bool(default_policy(name).get('protected'))})
+        for n in nets: netmap.setdefault(n,[]).append(name)
+        for m in obj.get('Mounts') or []:
+            key=str(m.get('Name') or m.get('Source') or '')
+            if key: volmap.setdefault(key,[]).append(name)
+    def pairs(items,kind,label):
+        vals=sorted(set(items))
+        for i,a in enumerate(vals):
+            for b in vals[i+1:]: edges.append({'source':a,'target':b,'kind':kind,'label':label})
+    for n,items in netmap.items():
+        if len(items)>1: pairs(items,'network',n)
+    for v,items in volmap.items():
+        if len(items)>1: pairs(items,'shared-volume',v)
+    return {'nodes':nodes,'edges':edges,'networks':{k:sorted(v) for k,v in netmap.items()},'shared_volumes':{k:sorted(v) for k,v in volmap.items() if len(v)>1}}
+
+@app.get('/api/dependencies')
+async def dependencies(authorization: str|None=Header(default=None)):
+    require_token(authorization); return await dependency_graph_data()
+
+@app.get('/api/disaster-recovery')
+async def disaster_recovery(authorization: str|None=Header(default=None)):
+    require_token(authorization)
+    with conn() as c:
+        snaps=rowdicts(c.execute('SELECT id,ts,container_name,reason,image_ref,image_id,compose_source,verified FROM config_snapshots ORDER BY id DESC LIMIT 200').fetchall())
+        backups={r['container_name']:dict(r) for r in c.execute('SELECT * FROM backup_status').fetchall()}
+    out=[]
+    for x in snaps:
+        try:
+            r=await docker('GET',f"/images/{quote(str(x.get('image_id') or ''),safe='')}/json"); image_present=r.status_code==200
+        except Exception: image_present=False
+        b=backups.get(x['container_name']); backup_ok=bool(b and now()-int(b['verified_ts'])<=BACKUP_MAX_AGE_HOURS*3600)
+        out.append({**x,'image_present':image_present,'compose_saved':bool(x.get('compose_source')),'data_backup_verified':backup_ok,'backup':b})
+    return out
+
+@app.post('/api/disaster-recovery/{snapshot_id}/test')
+async def test_disaster_recovery(snapshot_id: int, authorization: str|None=Header(default=None)):
+    require_token(authorization)
+    with conn() as c: r=c.execute('SELECT * FROM config_snapshots WHERE id=?',(snapshot_id,)).fetchone()
+    if not r: raise HTTPException(404,'Snapshot not found')
+    checks=[]
+    try: obj=json.loads(r['inspect_json']); checks.append({'check':'inspect-json','ok':True})
+    except Exception as e: return {'ok':False,'checks':[{'check':'inspect-json','ok':False,'detail':str(e)}]}
+    ir=await docker('GET',f"/images/{quote(str(r['image_id'] or ''),safe='')}/json"); checks.append({'check':'immutable-image-present','ok':ir.status_code==200,'detail':r['image_id']})
+    for net in ((obj.get('NetworkSettings') or {}).get('Networks') or {}):
+        nr=await docker('GET',f"/networks/{quote(net,safe='')}"); checks.append({'check':f'network:{net}','ok':nr.status_code==200})
+    cfg=_redacted_config(obj); checks.append({'check':'recreate-config-shape','ok':bool(cfg.get('image')),'detail':'configuration can be reconstructed from inspect snapshot'})
+    ok=all(x['ok'] for x in checks); audit('rollback-test',r['container_name'],'success' if ok else 'warning',{'snapshot_id':snapshot_id,'checks':checks})
+    return {'ok':ok,'snapshot_id':snapshot_id,'container':r['container_name'],'checks':checks,'note':'Dry-run only; no container was changed.'}
+
+@app.put('/api/backups/{name}')
+async def set_backup_status(name: str, request: Request, authorization: str|None=Header(default=None)):
+    require_token(authorization); d=await request.json(); provider=str(d.get('provider') or 'manual'); detail=str(d.get('detail') or '')[:1000]
+    with conn() as c: c.execute('INSERT OR REPLACE INTO backup_status(container_name,verified_ts,provider,detail) VALUES(?,?,?,?)',(name,now(),provider,detail))
+    audit('backup-verified',name,'success',{'provider':provider}); return {'ok':True,'container':name,'verified_ts':now(),'provider':provider}
+
+@app.get('/api/backups')
+async def backup_status_all(authorization: str|None=Header(default=None)):
+    require_token(authorization)
+    with conn() as c: rows=rowdicts(c.execute('SELECT * FROM backup_status ORDER BY verified_ts DESC').fetchall())
+    for r in rows: r['fresh']=now()-int(r['verified_ts'])<=BACKUP_MAX_AGE_HOURS*3600
+    return rows
+
+@app.put('/api/system/maintenance')
+async def global_maintenance(request: Request, authorization: str|None=Header(default=None)):
+    require_token(authorization); d=await request.json(); enabled=bool(d.get('enabled',True)); minutes=max(1,min(int(d.get('minutes',120)),1440)); value={'enabled':enabled,'until_ts':now()+minutes*60 if enabled else None,'reason':str(d.get('reason') or 'operator maintenance')}
+    with conn() as c: c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('global_maintenance',?)",(json.dumps(value),))
+    audit('global-maintenance','host','enabled' if enabled else 'disabled',value); return {'ok':True,**value}
+
+@app.get('/api/system/maintenance')
+async def global_maintenance_state(authorization: str|None=Header(default=None)):
+    require_token(authorization)
+    with conn() as c: r=c.execute("SELECT value FROM settings WHERE key='global_maintenance'").fetchone()
+    return _safe_json(r[0],{'enabled':False}) if r else {'enabled':False}
+
+@app.post('/api/discord/test')
+async def discord_test(authorization: str|None=Header(default=None)):
+    require_token(authorization)
+    if not DISCORD_WEBHOOK: raise HTTPException(409,'DISCORD_WEBHOOK_URL is not configured')
+    return await notify('Discord integration test',f'Kingdom Manager v{VERSION} can deliver security, update, rollback and recovery notifications.','info',force=True)
+
+@app.post('/api/simulate/{scenario}')
+async def simulate(scenario: str, authorization: str|None=Header(default=None)):
+    require_token(authorization); scenario=scenario.lower()
+    cases={
+      'falco-only':{'sources':['falco'],'risk':'medium','score':45,'expected':'investigate/baseline; no automatic isolation'},
+      'multi-source':{'sources':['falco','crowdsec'],'risk':'high','score':80,'expected':'capture evidence + recommend isolation; destructive action policy-gated'},
+      'malware':{'sources':['clamav'],'risk':'high','score':85,'expected':'preserve evidence + quarantine/recovery review'},
+      'sensor-outage':{'sources':['clamav-down'],'risk':'monitoring-degraded','score_effect':'Monitoring dimension only','expected':'notify + diagnose; do not claim clean posture'},
+      'update-failure':{'sources':['update'],'risk':'operational','expected':'automatic immutable-image/config rollback; isolate if rollback fails'},
+    }
+    if scenario not in cases: raise HTTPException(400,'scenario must be falco-only, multi-source, malware, sensor-outage, or update-failure')
+    return {'simulation':True,'scenario':scenario,'result':cases[scenario],'real_actions_performed':False}
+
+async def system_validation_data() -> dict:
+    checks=[]
+    def add(name,ok,detail=''): checks.append({'check':name,'ok':bool(ok),'detail':detail})
+    try:
+        with conn() as c: q=c.execute('PRAGMA quick_check').fetchone()[0]; add('database-integrity',q=='ok',q); sv=c.execute("SELECT value FROM settings WHERE key='schema_version'").fetchone(); add('schema-version',bool(sv and str(sv[0])==str(SCHEMA_VERSION)),str(sv[0]) if sv else 'missing')
+    except Exception as e: add('database-integrity',False,str(e))
+    try: r=await docker('GET','/_ping'); add('docker-api',r.status_code==200,r.text[:80])
+    except Exception as e: add('docker-api',False,str(e))
+    try:
+        sh=await core_sensor_health()
+        for k,v in sh.items(): add('sensor-'+k,v.get('status')=='ok',str(v.get('detail') or v.get('status'))[:180])
+    except Exception as e: add('sensors',False,str(e))
+    try:
+        sc=await security_score(f'Bearer {API_TOKEN}'); add('score-range',0<=int(sc['score'])<=100,str(sc['score'])); add('dimension-range',all(0<=int(v)<=100 for k,v in (sc.get('dimensions') or {}).items() if isinstance(v,(int,float))),str(sc.get('dimensions')))
+    except Exception as e: add('scoring',False,str(e))
+    try:
+        cs=await list_containers(); core=[x['name'] for x in cs if any(q in x['name'].lower() for q in ('kingdom-manager','falco','clamav','trivy','proxy-manager','portainer'))]; unprotected=[x for x in core if not default_policy(x).get('protected')]; add('core-self-protection',not unprotected,','.join(unprotected) or 'all protected')
+    except Exception as e: add('core-self-protection',False,str(e))
+    add('discord-configured',bool(DISCORD_WEBHOOK),'configured' if DISCORD_WEBHOOK else 'optional: add DISCORD_WEBHOOK_URL')
+    add('automatic-destructive-actions-off',not PLAYBOOK_AUTO_ISOLATE and not PLAYBOOK_AUTO_RECOVER,'safe default')
+    add('stateful-auto-update-blocked',not UPDATE_ALLOW_STATEFUL,'safe default' if not UPDATE_ALLOW_STATEFUL else 'explicitly enabled')
+    ok=all(x['ok'] for x in checks if x['check'] not in {'discord-configured'})
+    return {'ok':ok,'version':VERSION,'checks':checks,'passed':sum(1 for x in checks if x['ok']),'total':len(checks)}
+
+@app.get('/api/system/validate')
+async def system_validate(authorization: str|None=Header(default=None)):
+    require_token(authorization); result=await system_validation_data()
+    with conn() as c: c.execute('INSERT INTO validation_runs(ts,status,result_json) VALUES(?,?,?)',(now(),'passed' if result['ok'] else 'failed',json.dumps(result,default=str)))
+    return result
+
 @app.get("/api/recovery/plans")
 async def recovery_plans(authorization: str | None = Header(default=None)):
     require_token(authorization)
@@ -1846,7 +2376,7 @@ async def activity_feed(limit: int = 50, include_idle: bool = False, kind: str =
     category_map={
         'security':['security','security_event','suppression'],
         'scans':['trivy','trivy_auto_scan','trivy_auto_complete','trivy_auto_error','incident_scan'],
-        'incidents':['incident','incident_status','incident_isolated','investigation','evidence'],
+        'incidents':['incident','incident_status','incident_isolated','investigation','evidence','playbook'],
         'recovery':['recovery','recovery_failed','snapshot'],
         'system':['monitor_error','maintenance','update_check','container','policy','risk_profile','trivy_scheduler'],
     }
@@ -1856,7 +2386,7 @@ async def activity_feed(limit: int = 50, include_idle: bool = False, kind: str =
     if where: q+=" WHERE "+" AND ".join(where)
     q+=" ORDER BY id DESC LIMIT ?"; args.append(max(1,min(limit,200)))
     with conn() as c: rows=c.execute(q,args).fetchall()
-    icon_map={'security':'🛡','security_event':'🛡','trivy':'🔎','trivy_auto_scan':'🔎','trivy_auto_complete':'✅','trivy_auto_error':'⚠️','idle':'💤','recovery':'♻️','recovery_failed':'🚨','evidence':'🧾','snapshot':'📸','maintenance':'🛠','suppression':'🔕','update_check':'⬆️','monitor_error':'⚠️','trivy_scheduler':'🔎','incident_status':'🚨','incident_scan':'🔎','incident_isolated':'🚨','investigation':'🧠'}
+    icon_map={'security':'🛡','security_event':'🛡','trivy':'🔎','trivy_auto_scan':'🔎','trivy_auto_complete':'✅','trivy_auto_error':'⚠️','idle':'💤','recovery':'♻️','recovery_failed':'🚨','evidence':'🧾','snapshot':'📸','maintenance':'🛠','suppression':'🔕','update_check':'⬆️','monitor_error':'⚠️','trivy_scheduler':'🔎','incident_status':'🚨','incident_scan':'🔎','incident_isolated':'🚨','investigation':'🧠','playbook':'🧭'}
     out=[]
     for r in rows:
         d=dict(r); detail=d.get('detail') or ''; parsed=_safe_json(detail)
@@ -2019,6 +2549,8 @@ async def monitor_loop():
     await asyncio.sleep(20)
     while True:
         try:
+            if global_maintenance_active():
+                await asyncio.sleep(max(60, CHECK_SECONDS)); continue
             cs = await list_containers()
             for c in cs:
                 if c["name"] in {"kingdom-manager", "kingdom-manager-docker-api", TRIVY_RUNNER}:
@@ -2097,6 +2629,37 @@ async def trivy_auto_loop():
         await asyncio.sleep(max(300, TRIVY_AUTO_SCAN_EVERY_SECONDS))
 
 
+async def sensor_watch_loop():
+    await asyncio.sleep(45)
+    while True:
+        try:
+            health=await core_sensor_health()
+            with conn() as c:
+                for sensor,data in health.items():
+                    key=f'sensor_watch_{sensor}'; prev=c.execute('SELECT value FROM settings WHERE key=?',(key,)).fetchone(); previous=prev[0] if prev else 'unknown'; current=str(data.get('status') or 'unknown')
+                    if current!=previous:
+                        c.execute('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)',(key,current))
+                        if previous!='unknown':
+                            if current!='ok' and DISCORD_NOTIFY_SENSOR_FAILURES:
+                                asyncio.create_task(notify(f'{sensor.upper()} sensor degraded',f"Status changed {previous} → {current}. Detail: {str(data.get('detail') or '')[:800]}",'high',force=True))
+                            elif current=='ok' and DISCORD_NOTIFY_SENSOR_FAILURES:
+                                asyncio.create_task(notify(f'{sensor.upper()} sensor recovered',f'Status changed {previous} → OK. Monitoring coverage restored.','info',force=True))
+        except Exception as e: event('sensor_watch','host',str(e),'warning')
+        await asyncio.sleep(60)
+
+async def drift_scan_loop():
+    await asyncio.sleep(120)
+    while True:
+        if DRIFT_SCAN_ENABLED:
+            try:
+                for x in await list_containers():
+                    d=await drift_status(x['name'])
+                    if d.get('status')=='drift' and d.get('dangerous'):
+                        event('config_drift',x['name'],{'changes':d.get('changes'),'dangerous':d.get('dangerous')},'high')
+                        await notify('Dangerous configuration drift',f"{x['name']}: {', '.join(d.get('dangerous') or [])}",'high')
+            except Exception as e: event('drift_error','host',str(e),'warning')
+        await asyncio.sleep(max(300,DRIFT_SCAN_SECONDS))
+
 async def score_history_loop():
     await asyncio.sleep(75)
     while True:
@@ -2129,7 +2692,7 @@ async def reporting_loop():
 
 @app.on_event("startup")
 async def startup():
-    asyncio.create_task(monitor_loop()); asyncio.create_task(trivy_auto_loop()); asyncio.create_task(score_history_loop()); asyncio.create_task(reporting_loop())
+    asyncio.create_task(monitor_loop()); asyncio.create_task(trivy_auto_loop()); asyncio.create_task(score_history_loop()); asyncio.create_task(reporting_loop()); asyncio.create_task(update_engine_loop()); asyncio.create_task(drift_scan_loop()); asyncio.create_task(sensor_watch_loop())
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -2148,19 +2711,30 @@ DASHBOARD = r'''<!doctype html><html><head><meta charset="utf-8"><meta name="vie
 <div class="wrap"><div class="top"><div class="brand"><div class="crest">♛</div><div><h1>KINGDOM MANAGER</h1><div class="muted">Security Overview · Intelligence · Incident Response · Controlled Recovery · Reports</div></div></div><div class="system"><span class="okdot"></span><div><b id="systemState" class="good">Checking systems</b><div id="lastCheck" class="tiny">—</div></div><button onclick="logout()">Lock</button></div></div>
 <section class="hero"><div><h2 class="section-title">KINGDOM SECURITY SCORE</h2><div class="scorebox"><div id="scoreRing" class="ring"><div class="ringin"><div><div id="score" class="score">—</div><div class="muted">/100</div></div></div></div><div><div id="scoreStatus" class="status">CHECKING</div><h3>Overall Risk: <span id="overallRisk">—</span></h3><p id="scoreText" class="muted">Evaluating independent security engines and container risk.</p><div class="tiny"><span id="suppressed">0</span> known-good signals suppressed in 24h · Monitoring confidence <button style="padding:2px 7px;font-size:11px" onclick="openConfidence()"><span id="confidence">—</span>%</button></div><div id="dimensions" class="tiny" style="margin-top:10px;line-height:1.8">Threat — · Vulnerability — · Exposure — · Monitoring — · Trust —</div></div></div></div><div class="facewrap"><div class="facehalo"><div id="moodFace" class="face"><span class="eye l"></span><span class="eye r"></span><span class="mouth"></span></div></div><div class="tiny" style="margin-top:12px">KINGDOM SENTINEL</div></div><div class="severity"><div class="sevrow sev-critical"><span>⬡ CRITICAL</span><span id="sevCritical">0</span></div><div class="sevrow sev-high"><span>⬡ HIGH</span><span id="sevHigh">0</span></div><div class="sevrow sev-medium"><span>⬡ MEDIUM</span><span id="sevMedium">0</span></div><div class="sevrow sev-low"><span>⬡ LOW</span><span id="sevLow">0</span></div><div id="attention" class="attention" style="margin-top:16px"></div></div></section>
 <div id="engines" class="engines"></div>
-<div class="grid2"><div class="card"><h2 class="section-title">🚨 INCIDENT CENTER <span style="float:right;display:flex;gap:6px"><button style="font-size:11px" onclick="openBaselines()">Baselines</button><button style="font-size:11px" onclick="openTrustDiagnostics()">Trust</button><button style="font-size:11px" onclick="openIncidentHistory()">History</button></span></h2><div id="incidents" class="activity"></div></div><div class="card"><h2 class="section-title">🧠 EXPLAIN MY SCORE</h2><div id="scoreExplain" class="activity"></div></div></div>
+<div class="grid2"><div class="card"><h2 class="section-title">🚨 INCIDENT CENTER <span style="float:right;display:flex;gap:6px"><button style="font-size:11px" onclick="openBaselines()">Baselines</button><button style="font-size:11px" onclick="openTrustDiagnostics()">Trust</button><button style="font-size:11px" onclick="openIncidentHistory()">History</button><button style="font-size:11px" onclick="openUpdates()">Updates</button><button style="font-size:11px" onclick="openRecoveryCenter()">Recovery</button><button style="font-size:11px" onclick="openDrift()">Drift</button><button style="font-size:11px" onclick="openDependencies()">Map</button><button style="font-size:11px" onclick="openValidation()">Validate</button></span></h2><div id="incidents" class="activity"></div></div><div class="card"><h2 class="section-title">🧠 EXPLAIN MY SCORE</h2><div id="scoreExplain" class="activity"></div></div></div>
 <div class="grid2"><div class="card"><h2 class="section-title">CONTAINER RISK LEADERBOARD</h2><table class="table"><thead><tr><th>CONTAINER</th><th>SCORE</th><th>STATE</th><th>PROFILE</th><th>TOP RISK FACTOR</th></tr></thead><tbody id="leaderboard"></tbody></table></div><div class="card"><h2 class="section-title">RECENT KINGDOM ACTIVITY</h2><div id="activityFilters" class="filterbar"><button class="active" onclick="setActivityFilter('',this)">All</button><button onclick="setActivityFilter('security',this)">Security</button><button onclick="setActivityFilter('scans',this)">Scans</button><button onclick="setActivityFilter('incidents',this)">Incidents</button><button onclick="setActivityFilter('recovery',this)">Recovery</button><button onclick="setActivityFilter('system',this)">System</button></div><div id="activity" class="activity"></div></div></div>
-<div class="grid3"><div class="card"><h2 class="section-title">📈 SCORE HISTORY · 7 DAYS</h2><svg id="historyChart" class="chart" viewBox="0 0 500 110" preserveAspectRatio="none"></svg><div id="historyMeta" class="tiny"></div></div><div class="card"><h2 class="section-title">💡 SECURITY RECOMMENDATIONS</h2><div id="recommendations" class="activity"></div></div><div class="card"><h2 class="section-title">📋 REPORTING & NOTIFICATIONS</h2><div id="reporting"></div><div class="toolbar" style="margin-top:12px"><button onclick="sendReport('daily')">Send Daily</button><button onclick="sendReport('weekly')">Send Weekly</button></div></div></div>
-<div class="card containers"><h2 class="section-title">CONTAINER LIFE & CONTROLS</h2><div id="containers"></div></div><div class="footer"><span>🧠 Decision Engine <b class="good">Active</b></span><span>🛡 Versioned DB migrations</span><span id="footerEval">Last evaluation —</span><span>v1.11.3 · Canonical Scoring + Trust Pipeline Fix ♛</span></div></div>
+<div class="grid3"><div class="card"><h2 class="section-title">📈 SCORE HISTORY · 7 DAYS</h2><svg id="historyChart" class="chart" viewBox="0 0 500 110" preserveAspectRatio="none"></svg><div id="historyMeta" class="tiny"></div></div><div class="card"><h2 class="section-title">💡 SECURITY RECOMMENDATIONS</h2><div id="recommendations" class="activity"></div></div><div class="card"><h2 class="section-title">📋 REPORTING & NOTIFICATIONS</h2><div id="reporting"></div><div class="toolbar" style="margin-top:12px"><button onclick="sendReport('daily')">Send Daily</button><button onclick="sendReport('weekly')">Send Weekly</button><button onclick="testDiscord()">Test Discord</button></div></div></div>
+<div class="card containers"><h2 class="section-title">CONTAINER LIFE & CONTROLS</h2><div id="containers"></div></div><div class="footer"><span>🧠 Decision Engine <b class="good">Active</b></span><span>🛡 Versioned DB migrations</span><span id="footerEval">Last evaluation —</span><span>v3.1.0 LTS · Recovery + Drift + Validation + Discord ♛</span></div></div>
 <script>
 let TOKEN=localStorage.getItem('km_token')||'',ACTIVITY_FILTER='',RECS=[];function hdr(){return {'Authorization':'Bearer '+TOKEN,'Content-Type':'application/json'}}async function api(url,opt={}){opt.headers={...(opt.headers||{}),...hdr()};let r=await fetch(url,opt);if(r.status===401){document.getElementById('login').classList.remove('hidden');throw Error('Unauthorized')}let t=await r.text(),d=t?JSON.parse(t):{};if(!r.ok)throw Error(d.detail||t);return d}function saveToken(){TOKEN=document.getElementById('token').value.trim();localStorage.setItem('km_token',TOKEN);load().then(()=>document.getElementById('login').classList.add('hidden')).catch(e=>document.getElementById('loginerr').textContent=e.message)}function logout(){localStorage.removeItem('km_token');TOKEN='';document.getElementById('login').classList.remove('hidden')}function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}function age(sec){if(sec==null)return'never';if(sec<60)return sec+'s ago';if(sec<3600)return Math.floor(sec/60)+'m ago';return Math.floor(sec/3600)+'h ago'}function toast(msg,tone='ok'){let box=document.getElementById('toastbox'),el=document.createElement('div');el.className='toast '+(tone==='error'?'error':tone==='warn'?'warn':'');el.textContent=msg;box.appendChild(el);setTimeout(()=>el.remove(),5000)}function kmDialog({title='Kingdom Manager',text='',input=false,value='',ok='Continue',danger=false}){return new Promise(resolve=>{let m=document.getElementById('kmModal'),i=document.getElementById('kmModalInput'),b=document.getElementById('kmModalOk'),c=document.getElementById('kmModalCancel');document.getElementById('kmModalTitle').textContent=title;document.getElementById('kmModalText').textContent=text;i.classList.toggle('hidden',!input);i.value=value;b.textContent=ok;b.classList.toggle('danger',danger);m.classList.remove('hidden');if(input)setTimeout(()=>i.focus(),30);let done=v=>{m.classList.add('hidden');b.onclick=c.onclick=null;resolve(v)};b.onclick=()=>done(input?i.value:true);c.onclick=()=>done(input?null:false)})}async function act(n,a){if((a==='stop'||a==='isolate')&&!(await kmDialog({title:`${a.toUpperCase()} ${n}?`,text:'This changes the running state or network exposure of the container.',ok:a.toUpperCase(),danger:true})))return;try{let url=a==='isolate'?`/api/containers/${encodeURIComponent(n)}/isolate`:`/api/containers/${encodeURIComponent(n)}/action/${a}`;await api(url,{method:'POST'});toast(`${a} completed for ${n}`);load()}catch(e){toast(e.message,'error')}}async function scan(n){try{let d=await api(`/api/containers/${encodeURIComponent(n)}/trivy`,{method:'POST'});toast(`Trivy ${n}: ${d.critical||0} critical · ${d.high||0} high · ${d.medium||0} medium`);load();if(!document.getElementById('drawer').classList.contains('hidden'))openDrawer(n)}catch(e){toast(e.message,'error')}}async function scanIncident(id,n){try{toast(`Trivy scan started for ${n}`,'warn');let d=await api(`/api/incidents/${id}/scan`,{method:'POST'}),sc=d.scan||{},a=d.assessment||{};toast(`Trivy ${n}: ${sc.critical||0} critical · ${sc.high||0} high · ${sc.medium||0} medium · assessment ${a.confidence||'?'}%`);await load();await openIncident(id)}catch(e){toast(e.message,'error')}}async function upd(n){try{let d=await api(`/api/containers/${encodeURIComponent(n)}/check-update`,{method:'POST'});toast(d.update_available?'New image pulled; container was not recreated automatically.':'No image ID change detected.');load()}catch(e){toast(e.message,'error')}}async function policy(n,key,value){try{await api(`/api/policies/${encodeURIComponent(n)}`,{method:'PUT',body:JSON.stringify({[key]:value})});load();if(!document.getElementById('drawer').classList.contains('hidden'))openDrawer(n)}catch(e){toast(e.message,'error')}}function policyButton(n,label,key,on,extra=''){return `<button class="policybtn ${on?'on':'off'} ${extra}" onclick="event.stopPropagation();policy('${esc(n)}','${key}',${on?'false':'true'})">${on?'✓':'○'} ${label}</button>`}function engineCard(name,icon,status,body){let cls=status==='ok'?'good':status==='down'||status==='error'?'bad':'warn';return `<div class="card"><div class="engine-head"><span>${icon} ${name.toUpperCase()}</span><span class="tag ${cls}">${esc(status||'ready').toUpperCase()}</span></div>${body}<div class="spark"></div></div>`}
-async function incidentStatus(id,status){await api(`/api/incidents/${id}/status`,{method:'POST',body:JSON.stringify({status})});load()}async function createRecovery(n,incidentId){try{let p=await api(`/api/recovery/plan/${encodeURIComponent(n)}`,{method:'POST',body:JSON.stringify({incident_id:incidentId})});let yes=await kmDialog({title:`Approve recovery plan #${p.plan_id}?`,text:`${n}: capture evidence → isolate → quarantine replacement → Trivy verification → recreate → health observation.`,ok:'Approve & Run',danger:true});if(!yes)return;let r=await api(`/api/recovery/${p.plan_id}/approve-and-run`,{method:'POST'});toast(r.ok?'Recovery completed successfully.':`Recovery stopped safely: ${r.reason||'review required'}`,r.ok?'ok':'warn');load();if(incidentId)openIncident(incidentId);else openDrawer(n)}catch(e){toast(e.message,'error')}}async function markIncidentExpected(id,rule,n){let p=await api('/api/suppressions/preview',{method:'POST',body:JSON.stringify({source:'falco',container_name:n,rule_contains:rule})});let preview=`NARROW SCOPE ONLY\n${p.scope}\n\nMatches in last 24h: ${p.matching_events_24h}\nCurrent container risk context: ${p.estimated_current_risk_points} points\n\nThis will NOT suppress the rule globally.`;let ok=await kmDialog({title:'Suppression impact preview',text:preview,ok:'Continue'});if(!ok)return;let expiry=await kmDialog({title:'Suppression duration',text:'Enter hours. Examples: 24 = 1 day, 168 = 7 days, 0 = permanent.',input:true,value:'168',ok:'Continue'});if(expiry===null)return;let reason=await kmDialog({title:'Reason for known-good behavior',text:`Scope: ${p.scope}`,input:true,value:'Known-good behavior for this container',ok:'Save suppression'});if(!reason)return;await api(`/api/incidents/${id}/mark-expected`,{method:'POST',body:JSON.stringify({rule,reason,expires_hours:Number(expiry)||0})});toast(`Known-good scope saved for ${n}: ${rule}`);closeDrawer();load()}async function isolateIncident(id){if(!(await kmDialog({title:'Isolate incident container?',text:'Kingdom Manager will remove the container from its current service networks and place it in quarantine.',ok:'Isolate',danger:true})))return;try{await api(`/api/incidents/${id}/isolate`,{method:'POST'});toast('Incident container isolated','warn');openIncident(id);load()}catch(e){toast(e.message,'error')}}async function openIncident(id){try{await incidentStatus(id,'investigating');let [inc,a]=await Promise.all([api(`/api/incidents/${id}`),api(`/api/incidents/${id}/investigation`)]);let n=inc.container_name||'',cls=a.classification||'unverified',tone=cls==='high-confidence-threat'?'bad':cls==='suspicious'?'warn':cls==='likely-expected'?'good':'';document.getElementById('drawerTitle').textContent=`Incident #${id} · ${n||'host'}`;document.getElementById('drawerSubtitle').textContent=`${inc.severity.toUpperCase()} · ${inc.status} · Kingdom assessment ${a.confidence}%`;let rules=(a.falco_rules||[]).map(x=>{let samples=(x.samples||[]).filter(z=>z.proc_exe||z.process||z.cmdline||z.image||z.user||z.fd).map(z=>`<div class="falco-sample tiny"><b>Observed</b>${z.proc_exe?` · exe ${esc(z.proc_exe)}`:''}${z.process?` · process ${esc(z.process)}`:''}${z.parent?` · parent ${esc(z.parent)}`:''}${z.user?` · user ${esc(z.user)}`:''}${z.image?`<br>image ${esc(z.image)}`:''}${z.cmdline?`<br>cmd ${esc(z.cmdline).slice(0,180)}`:''}${z.fd?`<br>fd ${esc(z.fd).slice(0,180)}`:''}</div>`).join('');return `<div class="event"><div><strong>${esc(x.rule)}</strong><span class="tiny">${x.count} matching events · first ${new Date(x.first_ts*1000).toLocaleString()} · last ${new Date(x.last_ts*1000).toLocaleString()}</span>${samples}</div><span class="tag ${x.severity==='critical'?'bad':'warn'}">${esc(x.severity)}</span></div>`}).join('')||'<div class="tiny">No Falco rules in the last 24h.</div>';let factors=(a.factors||[]).map(x=>`<div class="tiny" style="padding:5px 0">• ${esc(x)}</div>`).join('');let math=(a.confidence_math||[]).map(x=>`<div class="event"><span class="tiny">${esc(x.reason)}</span><b class="${x.points>=0?'good':'warn'}">${x.points>=0?'+':''}${x.points}%</b></div>`).join('')||'<div class="tiny">No confidence adjustments recorded.</div>';let scan=a.latest_scan?`Last successful · ${a.latest_scan.critical} critical · ${a.latest_scan.high} high · ${a.latest_scan.medium} medium · ${age(Math.max(0,Math.floor(Date.now()/1000)-a.latest_scan.ts))}`:'No successful scan';if(a.latest_scan_attempt&&a.latest_scan_attempt.status!=='ok')scan+=`<br><span class=\"bad\">Latest attempt: SCAN ERROR</span>`;let allow=!!a.recovery_available,top=a.top_rule||'',expected=!!a.expected_rule,recovery=(a.recovery_reasons||[]).map(x=>`<div class="tiny warn">• ${esc(x)}</div>`).join('');document.getElementById('drawerBody').innerHTML=`<section><h3>KINGDOM INTELLIGENCE</h3><p>${esc(a.intelligence_summary||a.summary)}</p><div class="kv"><b>Suggested action</b><span>${esc((a.recommended_action||'continue-investigation').replaceAll('-',' '))}</span></div></section><section><h3>KINGDOM ASSESSMENT</h3><div class="kv"><b>Classification</b><span class="${tone}">${esc(cls).replaceAll('-',' ').toUpperCase()}</span></div><div class="kv"><b>Confidence</b><span>${a.confidence}% ${a.confidence_delta?`(${a.confidence_delta>0?'+':''}${a.confidence_delta} since last assessment)`:''}</span></div><div class="kv"><b>Server score delta</b><span>${a.score_delta>0?'+':''}${a.score_delta||0}</span></div><p class="muted">${esc(a.summary)}</p>${factors}<h4>WHY THIS CONFIDENCE?</h4>${math}</section><section><h3>CORROBORATION</h3><div class="kv"><b>Falco match scope</b><span>${a.matching_falco_events||0} matching events for this incident rule</span></div><div class="kv"><b>Falco total</b><span>${a.falco_total_24h||0} total events across Kingdom (24h)</span></div><div class="kv"><b>Trivy</b><span>${esc(scan)}</span></div><div class="kv"><b>ClamAV</b><span>${a.source_counts?.clamav?'Evidence present':'No correlated evidence'}</span></div><div class="kv"><b>CrowdSec</b><span>${a.source_counts?.crowdsec?'Evidence present':'No correlated evidence'}</span></div></section><section><h3>ADAPTIVE BASELINE</h3><div class="kv"><b>State</b><span class="${a.baseline?.status==='stable'?'good':a.baseline?.status==='novel'?'warn':''}">${esc((a.baseline?.status||'unknown').toUpperCase())}</span></div><div class="kv"><b>Observed</b><span>${a.baseline?.count||0} matching events across ${a.baseline?.span_hours||0}h</span></div><div class="kv"><b>Baseline confidence</b><span>${a.baseline?.confidence||0}%</span></div><div class="tiny">Kingdom can attenuate Falco-only risk for stable behavior when Trivy is clean. The event is still recorded and the rule is never auto-suppressed.</div></section><section><h3>TOP FALCO RULES</h3>${rules}</section><section><h3>RESPONSE</h3><div class="toolbar"><button onclick="evidence(${id})">Capture Evidence</button>${n?`<button onclick="scanIncident(${id},'${esc(n)}')">Scan Now</button>`:''}${top&&n?(expected?`<span class="tag good">✓ EXPECTED${a.expected_rule?.expires_ts?' · expires '+new Date(a.expected_rule.expires_ts*1000).toLocaleString():' · permanent'}</span>`:`<button onclick="markIncidentExpected(${id},'${esc(top)}','${esc(n)}')">Mark Expected</button>`):''}${n?`<button class="danger" onclick="isolateIncident(${id})">Isolate</button>`:''}${allow?`<button class="danger" onclick="createRecovery('${esc(n)}',${id})">Approved Recovery</button>`:''}<button onclick="resolveIncident(${id})">Resolve</button></div>${!allow&&n?`<div style="margin-top:8px"><b class="tiny">Recovery unavailable:</b>${recovery}</div>`:''}</section>`;document.getElementById('drawer').classList.remove('hidden')}catch(e){toast(e.message,'error')}}async function evidence(id){try{let d=await api(`/api/incidents/${id}/capture-evidence`,{method:'POST'});toast('Evidence captured: '+(d.captured||[]).join(', '));load();openIncident(id)}catch(e){toast(e.message,'error')}}async function resolveIncident(id){let r=await kmDialog({title:`Resolve incident #${id}`,text:'Add an operator resolution note. The incident remains available in history.',input:true,value:'Resolved by operator',ok:'Resolve'});if(r===null)return;await api(`/api/incidents/${id}/resolve`,{method:'POST',body:JSON.stringify({resolution:r})});toast(`Incident #${id} resolved`);closeDrawer();load()}async function sendReport(k){try{let d=await api(`/api/reports/send/${k}`,{method:'POST'});toast(`${k} report processed · Discord: ${d.delivery.discord} · n8n: ${d.delivery.n8n}`);load()}catch(e){toast(e.message,'error')}}async function openIncidentHistory(){let rows=await api('/api/incidents?status=all');document.getElementById('drawerTitle').textContent='Incident History';document.getElementById('drawerSubtitle').textContent='Open, investigating, resolved and dismissed Kingdom incidents';document.getElementById('drawerBody').innerHTML=`<section><input id="historySearch" placeholder="Search incidents" oninput="filterIncidentHistory()"></section><section id="incidentHistoryRows">${rows.map(i=>`<div class="event incident-history-row" data-search="${esc((i.container_name||'host')+' '+i.title+' '+i.severity+' '+i.status)}"><div><strong>#${i.id} ${esc(i.container_name||'host')} · ${esc(i.severity).toUpperCase()}</strong><span class="tiny">${esc(i.status)} · ${esc(i.title)}</span></div><button onclick="openIncident(${i.id})">Open</button></div>`).join('')||'<div class="tiny">No incident history.</div>'}</section>`;document.getElementById('drawer').classList.remove('hidden')}function filterIncidentHistory(){let q=document.getElementById('historySearch').value.toLowerCase();document.querySelectorAll('.incident-history-row').forEach(x=>x.classList.toggle('hidden',!x.dataset.search.toLowerCase().includes(q)))}async function openConfidence(){let [ins,ss]=await Promise.all([api('/api/integrations'),api('/api/security/score')]);let names=['falco','trivy','clamav','crowdsec'];document.getElementById('drawerTitle').textContent='Monitoring Confidence';document.getElementById('drawerSubtitle').textContent=`${ss.monitoring_confidence}% visibility across core Kingdom security sensors`;document.getElementById('drawerBody').innerHTML=`<section>${names.map(n=>`<div class="event"><div><strong>${n.toUpperCase()}</strong><span class="tiny">${ins[n]?.configured===false?'Not configured':'Configured'} · ${esc(ins[n]?.status||'unknown')}</span></div><span class="tag ${ins[n]?.status==='ok'?'good':'bad'}">${ins[n]?.status==='ok'?'CONTRIBUTING':'DEGRADED'}</span></div>`).join('')}</section>${(ss.unavailable_sensors||[]).length?`<section><b>Score confidence deductions</b><div class="tiny">Unavailable: ${esc(ss.unavailable_sensors.join(', '))}</div></section>`:'<section><div class="attention-ok">✓ All four core security sensors are contributing.</div></section>'}`;document.getElementById('drawer').classList.remove('hidden')}async function setActivityFilter(category,btn){ACTIVITY_FILTER=category;document.querySelectorAll('#activityFilters button').forEach(x=>x.classList.remove('active'));btn.classList.add('active');await loadActivity()}async function loadActivity(){let ev=await api(`/api/activity?limit=60&include_idle=false${ACTIVITY_FILTER?'&category='+encodeURIComponent(ACTIVITY_FILTER):''}`);document.getElementById('activity').innerHTML=ev.map(e=>`<div class="event"><div><strong>${esc(e.icon)} ${esc(e.subject||e.kind)}</strong><span class="tiny">${esc(e.summary)}</span></div><span class="tiny">${new Date(e.ts*1000).toLocaleTimeString()}</span></div>`).join('')||'<div class="tiny">No activity in this filter.</div>'}async function openBaselines(container=''){let rows=await api('/api/intelligence/baselines?days=7');if(container)rows=rows.filter(x=>x.container===container);document.getElementById('drawerTitle').textContent='Kingdom Baseline Learning';document.getElementById('drawerSubtitle').textContent='Suggestions only — Kingdom never auto-suppresses learned behavior';document.getElementById('drawerBody').innerHTML=`<section>${rows.map(x=>`<div class="event"><div><strong>${esc(x.container)} · ${esc(x.rule)}</strong><span class="tiny">${x.count} events · ${x.days_seen} day(s) observed · ${x.span_hours}h span · baseline ${esc(x.status||'unknown')} · confidence ${x.confidence??x.baseline_confidence}% · effective adjustment ${x.effective_score_adjustment||0}</span><div class="event-actions">${x.approved?`<span class="tag good">✓ APPROVED${x.suppression?.expires_ts?' · expires '+new Date(x.suppression.expires_ts*1000).toLocaleString():' · permanent'}</span>`:`<button onclick="suppressFalco('${esc(x.container)}','${esc(x.rule)}')">Review / Mark Expected</button>`}</div></div><span class="tag ${x.approved||x.suggested?'good':'warn'}">${x.approved?'EXPECTED':x.suggested?'SUGGESTED':'OBSERVE'}</span></div>`).join('')||'<div class="tiny">No recurring behavior has enough history for a baseline suggestion yet.</div>'}</section>`;document.getElementById('drawer').classList.remove('hidden')}async function recommendationAction(r){if(r.action==='scan'&&r.container){await scan(r.container);return}if(r.action==='incident'&&r.incident_id){await openIncident(r.incident_id);return}if(r.action==='review-falco'&&r.container){await openBaselines(r.container);return}if(r.action==='diagnose'){await openConfidence();return}toast('Open the container security profile for details','warn')}
+async function incidentStatus(id,status){await api(`/api/incidents/${id}/status`,{method:'POST',body:JSON.stringify({status})});load()}async function createRecovery(n,incidentId){try{let p=await api(`/api/recovery/plan/${encodeURIComponent(n)}`,{method:'POST',body:JSON.stringify({incident_id:incidentId})});let yes=await kmDialog({title:`Approve recovery plan #${p.plan_id}?`,text:`${n}: capture evidence → isolate → quarantine replacement → Trivy verification → recreate → health observation.`,ok:'Approve & Run',danger:true});if(!yes)return;let r=await api(`/api/recovery/${p.plan_id}/approve-and-run`,{method:'POST'});toast(r.ok?'Recovery completed successfully.':`Recovery stopped safely: ${r.reason||'review required'}`,r.ok?'ok':'warn');load();if(incidentId)openIncident(incidentId);else openDrawer(n)}catch(e){toast(e.message,'error')}}async function markIncidentExpected(id,rule,n){let p=await api('/api/suppressions/preview',{method:'POST',body:JSON.stringify({source:'falco',container_name:n,rule_contains:rule})});let preview=`NARROW SCOPE ONLY\n${p.scope}\n\nMatches in last 24h: ${p.matching_events_24h}\nCurrent container risk context: ${p.estimated_current_risk_points} points\n\nThis will NOT suppress the rule globally.`;let ok=await kmDialog({title:'Suppression impact preview',text:preview,ok:'Continue'});if(!ok)return;let expiry=await kmDialog({title:'Suppression duration',text:'Enter hours. Examples: 24 = 1 day, 168 = 7 days, 0 = permanent.',input:true,value:'168',ok:'Continue'});if(expiry===null)return;let reason=await kmDialog({title:'Reason for known-good behavior',text:`Scope: ${p.scope}`,input:true,value:'Known-good behavior for this container',ok:'Save suppression'});if(!reason)return;await api(`/api/incidents/${id}/mark-expected`,{method:'POST',body:JSON.stringify({rule,reason,expires_hours:Number(expiry)||0})});toast(`Known-good scope saved for ${n}: ${rule}`);closeDrawer();load()}async function runSafePlaybook(id){try{toast('Running safe Kingdom playbook steps…','warn');let r=await api(`/api/incidents/${id}/playbook/run-safe`,{method:'POST'});toast(r.ok?'Safe playbook completed':'Playbook completed with warnings',r.ok?'ok':'warn');await load();await openIncident(id)}catch(e){toast(e.message,'error')}}async function isolateIncident(id){if(!(await kmDialog({title:'Isolate incident container?',text:'Kingdom Manager will remove the container from its current service networks and place it in quarantine.',ok:'Isolate',danger:true})))return;try{await api(`/api/incidents/${id}/isolate`,{method:'POST'});toast('Incident container isolated','warn');openIncident(id);load()}catch(e){toast(e.message,'error')}}async function openIncident(id){try{await incidentStatus(id,'investigating');let [inc,a,pb]=await Promise.all([api(`/api/incidents/${id}`),api(`/api/incidents/${id}/investigation`),api(`/api/incidents/${id}/playbook`)]);let n=inc.container_name||'',cls=a.classification||'unverified',tone=cls==='high-confidence-threat'?'bad':cls==='suspicious'?'warn':cls==='likely-expected'?'good':'';document.getElementById('drawerTitle').textContent=`Incident #${id} · ${n||'host'}`;document.getElementById('drawerSubtitle').textContent=`${inc.severity.toUpperCase()} · ${inc.status} · Kingdom assessment ${a.confidence}%`;let rules=(a.falco_rules||[]).map(x=>{let samples=(x.samples||[]).filter(z=>z.proc_exe||z.process||z.cmdline||z.image||z.user||z.fd).map(z=>`<div class="falco-sample tiny"><b>Observed</b>${z.proc_exe?` · exe ${esc(z.proc_exe)}`:''}${z.process?` · process ${esc(z.process)}`:''}${z.parent?` · parent ${esc(z.parent)}`:''}${z.user?` · user ${esc(z.user)}`:''}${z.image?`<br>image ${esc(z.image)}`:''}${z.cmdline?`<br>cmd ${esc(z.cmdline).slice(0,180)}`:''}${z.fd?`<br>fd ${esc(z.fd).slice(0,180)}`:''}</div>`).join('');return `<div class="event"><div><strong>${esc(x.rule)}</strong><span class="tiny">${x.count} matching events · first ${new Date(x.first_ts*1000).toLocaleString()} · last ${new Date(x.last_ts*1000).toLocaleString()}</span>${samples}</div><span class="tag ${x.severity==='critical'?'bad':'warn'}">${esc(x.severity)}</span></div>`}).join('')||'<div class="tiny">No Falco rules in the last 24h.</div>';let factors=(a.factors||[]).map(x=>`<div class="tiny" style="padding:5px 0">• ${esc(x)}</div>`).join('');let math=(a.confidence_math||[]).map(x=>`<div class="event"><span class="tiny">${esc(x.reason)}</span><b class="${x.points>=0?'good':'warn'}">${x.points>=0?'+':''}${x.points}%</b></div>`).join('')||'<div class="tiny">No confidence adjustments recorded.</div>';let scan=a.latest_scan?`Last successful · ${a.latest_scan.critical} critical · ${a.latest_scan.high} high · ${a.latest_scan.medium} medium · ${age(Math.max(0,Math.floor(Date.now()/1000)-a.latest_scan.ts))}`:'No successful scan';if(a.latest_scan_attempt&&a.latest_scan_attempt.status!=='ok')scan+=`<br><span class=\"bad\">Latest attempt: SCAN ERROR</span>`;let allow=!!a.recovery_available,top=a.top_rule||'',expected=!!a.expected_rule,recovery=(a.recovery_reasons||[]).map(x=>`<div class="tiny warn">• ${esc(x)}</div>`).join('');document.getElementById('drawerBody').innerHTML=`<section><h3>🧭 RESPONSE PLAYBOOK</h3><div class="tiny">${esc(pb.name||'Kingdom adaptive response')} · safe automation ${pb.enabled?'enabled':'disabled'}</div>${(pb.steps||[]).map((x,i)=>`<div class="event"><div><strong>${i+1}. ${esc(x.title)}</strong><span class="tiny">gate: ${esc(x.gate)}${x.auto_eligible?' · auto-eligible':''}${x.destructive?' · destructive':''}</span></div><span class="tag ${x.destructive?'bad':x.auto_eligible?'good':'warn'}">${x.destructive?'APPROVAL':x.auto_eligible?'SAFE AUTO':x.gate.toUpperCase()}</span></div>`).join('')}<div class="toolbar" style="margin-top:10px"><button onclick="runSafePlaybook(${id})">Run Safe Steps</button>${allow?`<button class="danger" onclick="createRecovery('${esc(n)}',${id})">Prepare Approved Recovery</button>`:''}</div></section><section><h3>KINGDOM INTELLIGENCE</h3><p>${esc(a.intelligence_summary||a.summary)}</p><div class="kv"><b>Suggested action</b><span>${esc((a.recommended_action||'continue-investigation').replaceAll('-',' '))}</span></div></section><section><h3>KINGDOM ASSESSMENT</h3><div class="kv"><b>Classification</b><span class="${tone}">${esc(cls).replaceAll('-',' ').toUpperCase()}</span></div><div class="kv"><b>Confidence</b><span>${a.confidence}% ${a.confidence_delta?`(${a.confidence_delta>0?'+':''}${a.confidence_delta} since last assessment)`:''}</span></div><div class="kv"><b>Server score delta</b><span>${a.score_delta>0?'+':''}${a.score_delta||0}</span></div><p class="muted">${esc(a.summary)}</p>${factors}<h4>WHY THIS CONFIDENCE?</h4>${math}</section><section><h3>CORROBORATION</h3><div class="kv"><b>Falco match scope</b><span>${a.matching_falco_events||0} matching events for this incident rule</span></div><div class="kv"><b>Falco total</b><span>${a.falco_total_24h||0} total events across Kingdom (24h)</span></div><div class="kv"><b>Trivy</b><span>${esc(scan)}</span></div><div class="kv"><b>ClamAV</b><span>${a.source_counts?.clamav?'Evidence present':'No correlated evidence'}</span></div><div class="kv"><b>CrowdSec</b><span>${a.source_counts?.crowdsec?'Evidence present':'No correlated evidence'}</span></div></section><section><h3>ADAPTIVE BASELINE</h3><div class="kv"><b>State</b><span class="${a.baseline?.status==='stable'?'good':a.baseline?.status==='novel'?'warn':''}">${esc((a.baseline?.status||'unknown').toUpperCase())}</span></div><div class="kv"><b>Observed</b><span>${a.baseline?.count||0} matching events across ${a.baseline?.span_hours||0}h</span></div><div class="kv"><b>Baseline confidence</b><span>${a.baseline?.confidence||0}%</span></div><div class="tiny">Kingdom can attenuate Falco-only risk for stable behavior when Trivy is clean. The event is still recorded and the rule is never auto-suppressed.</div></section><section><h3>TOP FALCO RULES</h3>${rules}</section><section><h3>RESPONSE</h3><div class="toolbar"><button onclick="evidence(${id})">Capture Evidence</button>${n?`<button onclick="scanIncident(${id},'${esc(n)}')">Scan Now</button>`:''}${top&&n?(expected?`<span class="tag good">✓ EXPECTED${a.expected_rule?.expires_ts?' · expires '+new Date(a.expected_rule.expires_ts*1000).toLocaleString():' · permanent'}</span>`:`<button onclick="markIncidentExpected(${id},'${esc(top)}','${esc(n)}')">Mark Expected</button>`):''}${n?`<button class="danger" onclick="isolateIncident(${id})">Isolate</button>`:''}${allow?`<button class="danger" onclick="createRecovery('${esc(n)}',${id})">Approved Recovery</button>`:''}<button onclick="resolveIncident(${id})">Resolve</button></div>${!allow&&n?`<div style="margin-top:8px"><b class="tiny">Recovery unavailable:</b>${recovery}</div>`:''}</section>`;document.getElementById('drawer').classList.remove('hidden')}catch(e){toast(e.message,'error')}}async function evidence(id){try{let d=await api(`/api/incidents/${id}/capture-evidence`,{method:'POST'});toast('Evidence captured: '+(d.captured||[]).join(', '));load();openIncident(id)}catch(e){toast(e.message,'error')}}async function resolveIncident(id){let r=await kmDialog({title:`Resolve incident #${id}`,text:'Add an operator resolution note. The incident remains available in history.',input:true,value:'Resolved by operator',ok:'Resolve'});if(r===null)return;await api(`/api/incidents/${id}/resolve`,{method:'POST',body:JSON.stringify({resolution:r})});toast(`Incident #${id} resolved`);closeDrawer();load()}async function sendReport(k){try{let d=await api(`/api/reports/send/${k}`,{method:'POST'});toast(`${k} report processed · Discord: ${d.delivery.discord} · n8n: ${d.delivery.n8n}`);load()}catch(e){toast(e.message,'error')}}async function openIncidentHistory(){let rows=await api('/api/incidents?status=all');document.getElementById('drawerTitle').textContent='Incident History';document.getElementById('drawerSubtitle').textContent='Open, investigating, resolved and dismissed Kingdom incidents';document.getElementById('drawerBody').innerHTML=`<section><input id="historySearch" placeholder="Search incidents" oninput="filterIncidentHistory()"></section><section id="incidentHistoryRows">${rows.map(i=>`<div class="event incident-history-row" data-search="${esc((i.container_name||'host')+' '+i.title+' '+i.severity+' '+i.status)}"><div><strong>#${i.id} ${esc(i.container_name||'host')} · ${esc(i.severity).toUpperCase()}</strong><span class="tiny">${esc(i.status)} · ${esc(i.title)}</span></div><button onclick="openIncident(${i.id})">Open</button></div>`).join('')||'<div class="tiny">No incident history.</div>'}</section>`;document.getElementById('drawer').classList.remove('hidden')}function filterIncidentHistory(){let q=document.getElementById('historySearch').value.toLowerCase();document.querySelectorAll('.incident-history-row').forEach(x=>x.classList.toggle('hidden',!x.dataset.search.toLowerCase().includes(q)))}async function openConfidence(){let [ins,ss]=await Promise.all([api('/api/integrations'),api('/api/security/score')]);let names=['falco','trivy','clamav','crowdsec'];document.getElementById('drawerTitle').textContent='Monitoring Confidence';document.getElementById('drawerSubtitle').textContent=`${ss.monitoring_confidence}% visibility across core Kingdom security sensors`;document.getElementById('drawerBody').innerHTML=`<section>${names.map(n=>`<div class="event"><div><strong>${n.toUpperCase()}</strong><span class="tiny">${ins[n]?.configured===false?'Not configured':'Configured'} · ${esc(ins[n]?.status||'unknown')}</span></div><span class="tag ${ins[n]?.status==='ok'?'good':'bad'}">${ins[n]?.status==='ok'?'CONTRIBUTING':'DEGRADED'}</span></div>`).join('')}</section>${(ss.unavailable_sensors||[]).length?`<section><b>Score confidence deductions</b><div class="tiny">Unavailable: ${esc(ss.unavailable_sensors.join(', '))}</div></section>`:'<section><div class="attention-ok">✓ All four core security sensors are contributing.</div></section>'}`;document.getElementById('drawer').classList.remove('hidden')}async function setActivityFilter(category,btn){ACTIVITY_FILTER=category;document.querySelectorAll('#activityFilters button').forEach(x=>x.classList.remove('active'));btn.classList.add('active');await loadActivity()}async function loadActivity(){let ev=await api(`/api/activity?limit=60&include_idle=false${ACTIVITY_FILTER?'&category='+encodeURIComponent(ACTIVITY_FILTER):''}`);document.getElementById('activity').innerHTML=ev.map(e=>`<div class="event"><div><strong>${esc(e.icon)} ${esc(e.subject||e.kind)}</strong><span class="tiny">${esc(e.summary)}</span></div><span class="tiny">${new Date(e.ts*1000).toLocaleTimeString()}</span></div>`).join('')||'<div class="tiny">No activity in this filter.</div>'}async function openBaselines(container=''){let rows=await api('/api/intelligence/baselines?days=7');if(container)rows=rows.filter(x=>x.container===container);document.getElementById('drawerTitle').textContent='Kingdom Baseline Learning';document.getElementById('drawerSubtitle').textContent='Suggestions only — Kingdom never auto-suppresses learned behavior';document.getElementById('drawerBody').innerHTML=`<section>${rows.map(x=>`<div class="event"><div><strong>${esc(x.container)} · ${esc(x.rule)}</strong><span class="tiny">${x.count} events · ${x.days_seen} day(s) observed · ${x.span_hours}h span · baseline ${esc(x.status||'unknown')} · confidence ${x.confidence??x.baseline_confidence}% · effective adjustment ${x.effective_score_adjustment||0}</span><div class="event-actions">${x.approved?`<span class="tag good">✓ APPROVED${x.suppression?.expires_ts?' · expires '+new Date(x.suppression.expires_ts*1000).toLocaleString():' · permanent'}</span>`:`<button onclick="suppressFalco('${esc(x.container)}','${esc(x.rule)}')">Review / Mark Expected</button>`}</div></div><span class="tag ${x.approved||x.suggested?'good':'warn'}">${x.approved?'EXPECTED':x.suggested?'SUGGESTED':'OBSERVE'}</span></div>`).join('')||'<div class="tiny">No recurring behavior has enough history for a baseline suggestion yet.</div>'}</section>`;document.getElementById('drawer').classList.remove('hidden')}async function recommendationAction(r){if(r.action==='scan'&&r.container){await scan(r.container);return}if(r.action==='incident'&&r.incident_id){await openIncident(r.incident_id);return}if(r.action==='review-falco'&&r.container){await openBaselines(r.container);return}if(r.action==='diagnose'){await openConfidence();return}toast('Open the container security profile for details','warn')}
 function closeDrawer(){document.getElementById('drawer').classList.add('hidden')}async function suppressFalco(n,rule){let p=await api('/api/suppressions/preview',{method:'POST',body:JSON.stringify({source:'falco',container_name:n,rule_contains:rule})});let go=await kmDialog({title:'Known-good suppression preview',text:`${p.scope}\n${p.matching_events_24h} matching events in 24h.\nGlobal suppression is blocked.`,ok:'Continue'});if(!go)return;let expiry=await kmDialog({title:'Duration',text:'Hours: 24=1 day, 168=7 days, 0=permanent',input:true,value:'168',ok:'Continue'});if(expiry===null)return;let reason=await kmDialog({title:'Reason',text:p.scope,input:true,value:'Known-good behavior for this container',ok:'Save suppression'});if(!reason)return;await api('/api/suppressions',{method:'POST',body:JSON.stringify({source:'falco',container_name:n,rule_contains:rule,reason,expires_hours:Number(expiry)||0})});toast('Scoped suppression added for '+rule);openDrawer(n)}async function maintenance(n,on){await api(`/api/maintenance/${encodeURIComponent(n)}`,{method:'PUT',body:JSON.stringify({enabled:on,minutes:60,reason:'Operator maintenance'})});openDrawer(n);load()}
 async function openDrawer(n){let d=await api(`/api/containers/${encodeURIComponent(n)}/security-profile`);document.getElementById('drawerTitle').textContent=n;document.getElementById('drawerSubtitle').textContent=(d.image||'')+' · '+(d.risk?.state||'unknown');let p=d.policy||{},r=d.risk||{},sc=d.last_successful_scan,attempt=d.latest_scan_attempt,m=d.maintenance||{};let sec=(d.recent_security_events||[]).slice(0,8).map(e=>`<div class="event"><div><strong class="${e.severity==='critical'?'bad':e.severity==='high'?'warn':''}">${esc(e.source)} · ${esc(e.severity)}</strong><span class="tiny">${esc(e.rule||e.message).slice(0,130)}</span>${e.source==='falco'&&e.rule?(e.expected?`<div class="event-actions"><span class="tag good">✓ EXPECTED${e.suppression?.expires_ts?' · '+age(Math.max(0,e.suppression.expires_ts-Math.floor(Date.now()/1000)))+' remaining':' · permanent'}</span></div>`:`<div class="event-actions"><button onclick="suppressFalco('${esc(n)}','${esc(e.rule)}')">Mark Expected</button></div>`):''}</div><span class="tiny">${new Date(e.ts*1000).toLocaleTimeString()}</span></div>`).join('')||'<div class="tiny">No recent security events.</div>';document.getElementById('drawerBody').innerHTML=`<section><div class="kv"><b>Security score</b><span>${r.score??100}/100 · ${esc(r.state||'healthy')}</span></div><div class="kv"><b>Profile</b><span>${esc(d.risk_profile?.profile)} ×${d.risk_profile?.weight}</span></div><div class="kv"><b>Networks</b><span>${esc((d.networks||[]).join(', '))}</span></div><div class="kv"><b>Top factors</b><span>${esc((r.factors||[]).join(' · '))}</span></div></section><section><h3>Recovery & Response Policy</h3><div class="policybar">${policyButton(n,'Approved Rebuild','allow_rebuild',!!p.allow_rebuild)}${policyButton(n,'Auto-Isolate','auto_isolate',!!p.auto_isolate)}${policyButton(n,'Auto-Restart','auto_restart',!!p.auto_restart)}${policyButton(n,'Protected','protected',!!p.protected,'protected')}</div><div class="toolbar" style="margin-top:10px"><button onclick="scan('${esc(n)}')">Scan Now</button><button onclick="act('${esc(n)}','restart')">Restart</button><button class="danger" onclick="act('${esc(n)}','isolate')">Isolate</button><button onclick="maintenance('${esc(n)}',${m.enabled?'false':'true'})">${m.enabled?'End Maintenance':'Maintenance 1h'}</button>${p.allow_rebuild&&!p.protected?`<button class="danger" onclick="createRecovery('${esc(n)}',${(d.incidents||[]).find(x=>!['resolved','dismissed'].includes(x.status))?.id||'null'})">Recovery Plan</button>`:''}</div></section><section><h3>Trivy Verification</h3>${attempt&&attempt.status!=='ok'?`<div class="kv"><b>Latest attempt</b><span class="bad">SCAN ERROR · ${age(Math.max(0,Math.floor(Date.now()/1000)-attempt.ts))}</span></div><div class="tiny bad">${esc(attempt.error||'Trivy scan failed').slice(0,220)}</div>`:(attempt?`<div class="kv"><b>Latest attempt</b><span class="good">OK · ${age(Math.max(0,Math.floor(Date.now()/1000)-attempt.ts))}</span></div>`:'')} ${sc?`<div class="kv"><b>Last successful scan</b><span>${sc.critical} critical · ${sc.high} high · ${sc.medium} medium · ${age(Math.max(0,Math.floor(Date.now()/1000)-sc.ts))}</span></div>`:'<div class="tiny">No successful scan yet.</div>'}</section><section><h3>Recent Security Evidence</h3>${sec}</section><section><h3>Mounts</h3><div class="tiny">${esc((d.mounts||[]).map(x=>`${x.destination} (${x.type}${x.rw?', rw':', ro'})`).join(' · ')||'None')}</div></section>`;document.getElementById('drawer').classList.remove('hidden')}
 async function openTrustDiagnostics(){try{let d=await api('/api/suppressions/diagnostics');document.getElementById('drawerTitle').textContent='Trust Pipeline Diagnostics';document.getElementById('drawerSubtitle').textContent=`${d.active} active approval(s) · ${d.matching_events_24h} matched event(s) in 24h · ${d.points_removed} max points removed`;document.getElementById('drawerBody').innerHTML=`<section><div class="tiny">Every approval below is exact container + source + rule scope. This view shows whether the approval actually reaches stored evidence and correlation scoring.</div></section><section>${(d.rows||[]).map(x=>`<div class="event"><div><strong>${esc(x.container_name||'host')} · ${esc(x.rule_contains||x.source)}</strong><span class="tiny">${x.active?'ACTIVE':'INACTIVE'} · ${x.matching_events_24h} matching events · ${x.matching_correlations_24h} matching evaluations · ${x.live_original_risk??0} raw → ${x.live_effective_risk??0} effective · ${x.points_removed} points removed${x.expires_ts?' · expires '+new Date(x.expires_ts*1000).toLocaleString():' · permanent'}</span>${x.sample_match?`<div class="tiny good">Matched: ${esc(x.sample_match).slice(0,180)}</div>`:''}${x.blocker?`<div class="tiny warn">Why not applied: ${esc(x.blocker)}</div>`:''}</div><span class="tag ${x.active&&x.matching_correlations_24h?'good':'warn'}">${x.active&&x.matching_correlations_24h?'APPLIED':x.active?'CHECK':'EXPIRED'}</span></div>`).join('')||'<div class="tiny">No suppression approvals exist.</div>'}</section>`;document.getElementById('drawer').classList.remove('hidden')}catch(e){toast(e.message,'error')}}
 
 function drawHistory(rows){let svg=document.getElementById('historyChart');if(!rows.length){svg.innerHTML='<text x="10" y="55" fill="#8fa3b5">History begins after this upgrade.</text>';document.getElementById('historyMeta').textContent='';return}let w=500,h=110,min=Math.min(...rows.map(x=>x.score)),max=Math.max(...rows.map(x=>x.score));let pts=rows.map((x,i)=>`${(i/(Math.max(1,rows.length-1))*w).toFixed(1)},${(h-10-(x.score/100)*(h-20)).toFixed(1)}`).join(' ');svg.innerHTML=`<polyline fill="none" stroke="#32b7ff" stroke-width="3" points="${pts}"/><line x1="0" y1="${h-10-0.75*(h-20)}" x2="500" y2="${h-10-0.75*(h-20)}" stroke="#294153" stroke-dasharray="4 4"/>`;document.getElementById('historyMeta').textContent=`${rows[0].score} → ${rows[rows.length-1].score} · range ${min}–${max}`}
-async function load(){let [ins,fs,ts,ss,cs,incs,explain,hist,recs,reph]=await Promise.all([api('/api/integrations'),api('/api/security/falco/summary'),api('/api/security/trivy/summary'),api('/api/security/score'),api('/api/containers'),api('/api/incidents'),api('/api/security/explain-score'),api('/api/security/history?hours=168'),api('/api/recommendations'),api('/api/reports/history')]);let engineHealth=ss.sensor_health||ins;let healthy=['clamav','crowdsec','falco','trivy'].every(k=>engineHealth[k]?.status==='ok');document.getElementById('systemState').textContent=healthy?'All Systems Operational':'Review Security Engines';document.getElementById('systemState').className=healthy?'good':'warn';document.getElementById('lastCheck').textContent='Last check: just now';let color=ss.score>=90?'#4ee07d':ss.score>=75?'#92e65c':ss.score>=55?'#ffd24d':ss.score>=35?'#ff9f35':'#ff5f57',ring=document.getElementById('scoreRing');ring.style.setProperty('--score',ss.score);ring.style.setProperty('--mood',color);document.getElementById('score').textContent=ss.score;document.getElementById('scoreStatus').textContent=ss.status;document.getElementById('scoreStatus').style.color=color;document.getElementById('overallRisk').textContent=ss.overall_risk;document.getElementById('confidence').textContent=ss.monitoring_confidence;let dm=ss.dimensions||{};document.getElementById('dimensions').textContent=`Threat ${dm.threat??'—'} · Vulnerability ${dm.vulnerability??'—'} · Exposure ${dm.exposure??'—'} · Monitoring ${dm.monitoring??'—'} · Trust ${dm.trust??'—'}`;document.getElementById('scoreText').textContent=(ss.unavailable_sensors||[]).length?`Monitoring degraded: ${(ss.unavailable_sensors||[]).join(', ')} unavailable.`:ss.score>=90?'Your Kingdom is secure. No significant correlated threats are active.':ss.score>=75?'Your Kingdom is stable. A few signals deserve observation.':ss.score>=55?'Elevated activity detected. Review the risk leaderboard.':ss.score>=35?'High-risk evidence needs investigation.':'Critical correlated risk requires immediate attention.';document.getElementById('suppressed').textContent=ss.suppressed_24h||0;document.getElementById('moodFace').className='face '+ss.mood;let halo=document.querySelector('.facehalo');halo.style.borderColor=color;halo.style.boxShadow=`0 0 0 9px ${color}12,0 0 42px ${color}35`;let sc=ss.severity_counts||{};['Critical','High','Medium','Low'].forEach(k=>document.getElementById('sev'+k).textContent=sc[k.toLowerCase()]||0);let urgent=ss.immediate_attention||[],medium=(incs||[]).filter(x=>x.severity==='medium').length;document.getElementById('attention').innerHTML='<h3>IMMEDIATE ATTENTION</h3>'+(urgent.length?urgent.map(x=>`<div class="event"><div><strong class="bad">${esc(x.container)} · ${esc(x.state)}</strong><span class="tiny">${esc(x.factors[0])}</span></div><b>${x.score}</b></div>`).join(''):`<div class="attention-ok"><div class="check">✓</div>No urgent incidents.${medium?`<div class="warn">${medium} medium incident${medium>1?'s':''} require review.</div>`:''}</div>`);let fc=fs.counts_24h||{},sched=(ts.scheduler||{}).state||(ts.auto_scan_enabled?'starting':'disabled'),trivystatus=sched==='error'?'error':sched.startsWith('scanning:')?'scanning':engineHealth.trivy?.status||ins.trivy.status;document.getElementById('engines').innerHTML=engineCard('Falco','🦅',engineHealth.falco?.status||ins.falco.status,`<div class="engine-kpi">${fs.events_24h||0}</div><div class="tiny">Events (24h) · <span class="sev-critical">${fc.critical||0} critical</span> · <span class="sev-high">${fc.high||0} high</span><br>Last event ${age(fs.last_event_age_seconds)}</div>`)+engineCard('Trivy','◇',trivystatus,`<div class="engine-kpi">${ts.scans_24h||0}</div><div class="tiny">Scans (24h) · <span class="sev-critical">${ts.critical_24h||0} critical</span> · <span class="sev-high">${ts.high_24h||0} high</span><br>Scheduler: ${esc(sched)}${(ts.scheduler||{}).last_error?'<br><span class="bad">'+esc((ts.scheduler||{}).last_error).slice(0,100)+'</span>':''}</div>`)+engineCard('ClamAV','⬡',engineHealth.clamav?.status||ins.clamav.status,`<div class="engine-kpi">${(engineHealth.clamav?.status||ins.clamav.status)==='ok'?'Clean':'Review'}</div><div class="tiny">Malware scanning sensor</div>`)+engineCard('CrowdSec','♜',engineHealth.crowdsec?.status||ins.crowdsec.status,`<div class="engine-kpi">${(engineHealth.crowdsec?.status||ins.crowdsec.status)==='ok'?'Active':'Review'}</div><div class="tiny">Host intrusion decisions & firewall context</div>`);document.getElementById('incidents').innerHTML=incs.length?incs.slice(0,8).map(i=>`<div class="event"><div><strong class="${i.severity==='critical'?'bad':i.severity==='high'?'warn':''}">#${i.id} ${esc(i.container_name||'host')} · ${esc(i.severity).toUpperCase()}</strong><span class="tiny">${esc(i.title)} · ${esc((i.sources||[]).join(', '))}</span><div class="event-actions"><button onclick="openIncident(${i.id})">Investigate</button><button onclick="evidence(${i.id})">Capture Evidence</button><button onclick="resolveIncident(${i.id})">Resolve</button></div></div><span class="tag warn">${esc(i.status)}</span></div>`).join(''):'<div class="attention-ok">✓ No active incidents.</div>';document.getElementById('scoreExplain').innerHTML=(explain.contributors||[]).length?(explain.contributors||[]).slice(0,8).map(x=>`<div class="event"><div><strong>${esc(x.subject)}</strong><span class="tiny">${esc(x.detail)}</span></div><b>−${x.points_lost}</b></div>`).join(''):'<div class="attention-ok">✓ No active deductions.</div>';document.getElementById('leaderboard').innerHTML=(ss.leaderboard||[]).map(x=>`<tr class="clickable" onclick="openDrawer('${esc(x.container)}')"><td><b>${esc(x.container)}</b></td><td><b>${x.score}</b></td><td class="state ${x.score>=75?'good':x.score>=55?'warn':'bad'}">${esc(x.state).toUpperCase()}</td><td>${esc(x.profile)}</td><td class="tiny">${esc(x.factors[0])}</td></tr>`).join('');await loadActivity();drawHistory(hist);RECS=recs;document.getElementById('recommendations').innerHTML=recs.length?recs.slice(0,10).map((r,idx)=>`<div class="event recommend ${esc(r.priority)}"><div><strong>${esc(r.title)}</strong><span class="tiny">${esc(r.detail)}</span><div class="event-actions"><button onclick='recommendationAction(RECS[${idx}])'>${r.action==='scan'?'Scan Now':r.action==='incident'?'Investigate':r.action==='diagnose'?'Diagnose':r.action==='review-falco'?'Review Falco':'Review'}</button></div></div><span class="tag ${r.priority==='critical'||r.priority==='high'?'bad':r.priority==='medium'?'warn':'good'}">${esc(r.priority)}</span></div>`).join(''):'<div class="attention-ok">✓ No recommendations right now.</div>';document.getElementById('reporting').innerHTML=`<div class="kv"><b>Discord</b><span class="${ins.discord?.configured?'good':'muted'}">${ins.discord?.configured?'Configured':'Not configured'}</span></div><div class="kv"><b>n8n</b><span class="${ins.n8n?.configured?'good':'muted'}">${ins.n8n?.configured?'Configured':'Not configured'}</span></div><div class="kv"><b>Recent reports</b><span>${reph.length}</span></div>`;document.getElementById('containers').innerHTML=cs.map(c=>{let p=c.policy||{};return `<div class="container-row" onclick="openDrawer('${esc(c.name)}')"><div style="min-width:0"><b>${esc(c.name)}</b> <span class="tag ${c.state==='running'?'good':'bad'}">${esc(c.state)}</span><div class="tiny">${esc(c.image)} · ${esc(c.status)}</div><div class="policybar">${policyButton(c.name,'Approved Rebuild','allow_rebuild',!!p.allow_rebuild)}${policyButton(c.name,'Auto-Isolate','auto_isolate',!!p.auto_isolate)}${policyButton(c.name,'Auto-Restart','auto_restart',!!p.auto_restart)}${policyButton(c.name,'Protected','protected',!!p.protected,'protected')}</div></div><div class="toolbar"><button onclick="event.stopPropagation();act('${esc(c.name)}','start')">Start</button><button onclick="event.stopPropagation();act('${esc(c.name)}','restart')">Restart</button><button class="danger" onclick="event.stopPropagation();act('${esc(c.name)}','stop')">Stop</button><button onclick="event.stopPropagation();scan('${esc(c.name)}')">Trivy</button></div></div>`}).join('');document.getElementById('footerEval').textContent='Last full evaluation '+new Date(ss.evaluated_ts*1000).toLocaleTimeString()}
+async function checkUpdate(n){try{toast('Capturing rollback snapshot and checking image…','warn');let p=await api(`/api/updates/${encodeURIComponent(n)}/check`,{method:'POST'});if(p.status==='current'){toast(`${n} is current. Rollback snapshot saved.`,'ok');return}let v=await api(`/api/updates/${p.plan_id}/verify`,{method:'POST'});if(!v.ok){toast(`Update blocked by verification for ${n}`,'error');return}let ok=await kmDialog({title:`Apply verified update to ${n}?`,text:`Rollback snapshot #${p.rollback_snapshot.snapshot_id} is ready. If post-update health fails, Kingdom will automatically restore image ${String(p.old_image_id).slice(0,28)}…`,ok:'Apply Update',danger:true});if(!ok)return;let r=await api(`/api/updates/${p.plan_id}/apply`,{method:'POST'});toast(r.ok?'Update completed; rollback remains available.':'Update failed','ok');load()}catch(e){toast(e.message,'error')}}
+async function rollbackUpdate(id,n){if(!(await kmDialog({title:`Rollback ${n}?`,text:'Kingdom will recreate the container from its saved pre-update Docker configuration and immutable previous image ID.',ok:'Rollback',danger:true})))return;try{let r=await api(`/api/updates/${id}/rollback`,{method:'POST'});toast(`Rollback completed for ${n}`,'ok');openUpdates();load()}catch(e){toast(e.message,'error')}}
+async function openUpdates(){try{let rows=await api('/api/updates');document.getElementById('drawerTitle').textContent='Update & Rollback Center';document.getElementById('drawerSubtitle').textContent='Staged image verification · immutable rollback snapshots · audit trail';document.getElementById('drawerBody').innerHTML=`<section><h3>SAFE UPDATE MODEL</h3><p class="muted">Kingdom captures the exact running image ID, environment, labels, mounts, restart policy, ports and networks before pulling a candidate. Verified updates can be rolled back to that immutable image/configuration.</p></section><section><h3>RECENT UPDATE PLANS</h3>${rows.map(x=>`<div class="event"><div><strong>${esc(x.container_name)}</strong><span class="tiny">#${x.id} · ${esc(x.status)} · ${new Date(x.created_ts*1000).toLocaleString()}<br>${esc(String(x.old_image_id||'').slice(0,22))} → ${esc(String(x.candidate_image_id||'').slice(0,22))}</span></div><div class="toolbar">${['completed','failed','rolled-back'].includes(x.status)?`<button onclick="rollbackUpdate(${x.id},'${esc(x.container_name)}')">Rollback</button>`:''}</div></div>`).join('')||'<div class="tiny">No update checks yet.</div>'}</section>`;document.getElementById('drawer').classList.remove('hidden')}catch(e){toast(e.message,'error')}}
+async function testDiscord(){try{let r=await api('/api/discord/test',{method:'POST'});toast('Discord test sent · '+r.discord,'ok')}catch(e){toast(e.message,'error')}}
+async function openRecoveryCenter(){try{let rows=await api('/api/disaster-recovery');document.getElementById('drawerTitle').textContent='Disaster Recovery Center';document.getElementById('drawerSubtitle').textContent='Immutable image/config snapshots · dry-run validation · data-backup awareness';document.getElementById('drawerBody').innerHTML=`<section><div class="tiny">Image/config rollback can restore Docker state. Stateful application data requires a separate verified backup.</div></section><section>${rows.slice(0,80).map(x=>`<div class="event"><div><strong>${esc(x.container_name)} · snapshot #${x.id}</strong><span class="tiny">${new Date(x.ts*1000).toLocaleString()} · ${esc(x.reason)}<br>image ${esc(String(x.image_id||'').slice(0,24))} · ${x.image_present?'image ready':'image missing'} · ${x.data_backup_verified?'data backup verified':'data backup unverified'}${x.compose_source?' · compose '+esc(x.compose_source):''}</span></div><button onclick="testRecovery(${x.id})">Test</button></div>`).join('')||'<div class="tiny">No rollback snapshots yet.</div>'}</section>`;document.getElementById('drawer').classList.remove('hidden')}catch(e){toast(e.message,'error')}}
+async function testRecovery(id){try{let r=await api(`/api/disaster-recovery/${id}/test`,{method:'POST'});toast(r.ok?'Rollback dry-run passed':'Rollback dry-run has warnings',r.ok?'ok':'warn');openRecoveryCenter()}catch(e){toast(e.message,'error')}}
+async function openDrift(){try{let rows=await api('/api/drift');document.getElementById('drawerTitle').textContent='Configuration Drift';document.getElementById('drawerSubtitle').textContent='Detects unexpected privilege, port, network, mount, capability and configuration changes';document.getElementById('drawerBody').innerHTML=`<section>${rows.map(x=>`<div class="event"><div><strong>${esc(x.container)}</strong><span class="tiny">${esc(x.status)}${(x.changes||[]).length?' · changed: '+esc(x.changes.join(', ')):''}${(x.dangerous||[]).length?'<br><span class="bad">'+esc(x.dangerous.join(' · '))+'</span>':''}${(x.secret_env_keys||[]).length?'<br>secret-like environment keys: '+esc(x.secret_env_keys.join(', ')):''}</span></div><div class="toolbar">${x.status==='unbaselined'?`<button onclick="approveDrift('${esc(x.container)}')">Approve Baseline</button>`:''}${x.status==='drift'?`<button onclick="approveDrift('${esc(x.container)}')">Accept Current</button>`:''}</div></div>`).join('')}</section>`;document.getElementById('drawer').classList.remove('hidden')}catch(e){toast(e.message,'error')}}
+async function approveDrift(n){if(!(await kmDialog({title:`Approve configuration baseline for ${n}?`,text:'Future changes to privilege, ports, mounts, capabilities, networks and other configuration will be compared against this snapshot.',ok:'Approve'})))return;await api(`/api/drift/${encodeURIComponent(n)}/approve`,{method:'POST'});toast('Configuration baseline approved for '+n,'ok');openDrift()}
+async function openDependencies(){try{let d=await api('/api/dependencies');document.getElementById('drawerTitle').textContent='Kingdom Dependency Map';document.getElementById('drawerSubtitle').textContent=`${d.nodes.length} containers · ${d.edges.length} discovered relationships`;document.getElementById('drawerBody').innerHTML=`<section><h3>SHARED NETWORKS</h3>${Object.entries(d.networks||{}).map(([k,v])=>`<div class="kv"><b>${esc(k)}</b><span>${esc(v.join(', '))}</span></div>`).join('')}</section><section><h3>SHARED VOLUMES</h3>${Object.entries(d.shared_volumes||{}).map(([k,v])=>`<div class="kv"><b>${esc(k).slice(0,45)}</b><span>${esc(v.join(', '))}</span></div>`).join('')||'<div class="tiny">No shared volumes detected.</div>'}</section>`;document.getElementById('drawer').classList.remove('hidden')}catch(e){toast(e.message,'error')}}
+async function openValidation(){try{let r=await api('/api/system/validate');document.getElementById('drawerTitle').textContent='System Validation';document.getElementById('drawerSubtitle').textContent=`${r.passed}/${r.total} checks passed · ${r.ok?'production-ready checks passed':'review failures'}`;document.getElementById('drawerBody').innerHTML=`<section>${r.checks.map(x=>`<div class="event"><div><strong>${esc(x.check)}</strong><span class="tiny">${esc(String(x.detail||''))}</span></div><span class="tag ${x.ok?'good':'bad'}">${x.ok?'PASS':'FAIL'}</span></div>`).join('')}</section><section><div class="toolbar"><button onclick="simulateScenario('falco-only')">Simulate Falco</button><button onclick="simulateScenario('multi-source')">Simulate Multi-source</button><button onclick="simulateScenario('update-failure')">Simulate Rollback</button></div></section>`;document.getElementById('drawer').classList.remove('hidden')}catch(e){toast(e.message,'error')}}
+async function simulateScenario(s){try{let r=await api(`/api/simulate/${s}`,{method:'POST'});await kmDialog({title:'Simulation: '+s,text:JSON.stringify(r.result,null,2),ok:'Close'})}catch(e){toast(e.message,'error')}}
+async function load(){let [ins,fs,ts,ss,cs,incs,explain,hist,recs,reph]=await Promise.all([api('/api/integrations'),api('/api/security/falco/summary'),api('/api/security/trivy/summary'),api('/api/security/score'),api('/api/containers'),api('/api/incidents'),api('/api/security/explain-score'),api('/api/security/history?hours=168'),api('/api/recommendations'),api('/api/reports/history')]);let engineHealth=ss.sensor_health||ins;let healthy=['clamav','crowdsec','falco','trivy'].every(k=>engineHealth[k]?.status==='ok');document.getElementById('systemState').textContent=healthy?'All Systems Operational':'Review Security Engines';document.getElementById('systemState').className=healthy?'good':'warn';document.getElementById('lastCheck').textContent='Last check: just now';let color=ss.score>=90?'#4ee07d':ss.score>=75?'#92e65c':ss.score>=55?'#ffd24d':ss.score>=35?'#ff9f35':'#ff5f57',ring=document.getElementById('scoreRing');ring.style.setProperty('--score',ss.score);ring.style.setProperty('--mood',color);document.getElementById('score').textContent=ss.score;document.getElementById('scoreStatus').textContent=ss.status;document.getElementById('scoreStatus').style.color=color;document.getElementById('overallRisk').textContent=ss.overall_risk;document.getElementById('confidence').textContent=ss.monitoring_confidence;let dm=ss.dimensions||{};document.getElementById('dimensions').textContent=`Threat ${dm.threat??'—'} · Vulnerability ${dm.vulnerability??'—'} · Exposure ${dm.exposure??'—'} · Monitoring ${dm.monitoring??'—'} · Trust ${dm.trust??'—'}`;document.getElementById('scoreText').textContent=(ss.unavailable_sensors||[]).length?`Monitoring degraded: ${(ss.unavailable_sensors||[]).join(', ')} unavailable.`:ss.score>=90?'Your Kingdom is secure. No significant correlated threats are active.':ss.score>=75?'Your Kingdom is stable. A few signals deserve observation.':ss.score>=55?'Elevated activity detected. Review the risk leaderboard.':ss.score>=35?'High-risk evidence needs investigation.':'Critical correlated risk requires immediate attention.';document.getElementById('suppressed').textContent=ss.suppressed_24h||0;document.getElementById('moodFace').className='face '+ss.mood;let halo=document.querySelector('.facehalo');halo.style.borderColor=color;halo.style.boxShadow=`0 0 0 9px ${color}12,0 0 42px ${color}35`;let sc=ss.severity_counts||{};['Critical','High','Medium','Low'].forEach(k=>document.getElementById('sev'+k).textContent=sc[k.toLowerCase()]||0);let urgent=ss.immediate_attention||[],medium=(incs||[]).filter(x=>x.severity==='medium').length;document.getElementById('attention').innerHTML='<h3>IMMEDIATE ATTENTION</h3>'+(urgent.length?urgent.map(x=>`<div class="event"><div><strong class="bad">${esc(x.container)} · ${esc(x.state)}</strong><span class="tiny">${esc(x.factors[0])}</span></div><b>${x.score}</b></div>`).join(''):`<div class="attention-ok"><div class="check">✓</div>No urgent incidents.${medium?`<div class="warn">${medium} medium incident${medium>1?'s':''} require review.</div>`:''}</div>`);let fc=fs.counts_24h||{},sched=(ts.scheduler||{}).state||(ts.auto_scan_enabled?'starting':'disabled'),trivystatus=sched==='error'?'error':sched.startsWith('scanning:')?'scanning':engineHealth.trivy?.status||ins.trivy.status;document.getElementById('engines').innerHTML=engineCard('Falco','🦅',engineHealth.falco?.status||ins.falco.status,`<div class="engine-kpi">${fs.events_24h||0}</div><div class="tiny">Events (24h) · <span class="sev-critical">${fc.critical||0} critical</span> · <span class="sev-high">${fc.high||0} high</span><br>Last event ${age(fs.last_event_age_seconds)}</div>`)+engineCard('Trivy','◇',trivystatus,`<div class="engine-kpi">${ts.scans_24h||0}</div><div class="tiny">Scans (24h) · <span class="sev-critical">${ts.critical_24h||0} critical</span> · <span class="sev-high">${ts.high_24h||0} high</span><br>Scheduler: ${esc(sched)}${(ts.scheduler||{}).last_error?'<br><span class="bad">'+esc((ts.scheduler||{}).last_error).slice(0,100)+'</span>':''}</div>`)+engineCard('ClamAV','⬡',engineHealth.clamav?.status||ins.clamav.status,`<div class="engine-kpi">${(engineHealth.clamav?.status||ins.clamav.status)==='ok'?'Clean':'Review'}</div><div class="tiny">Malware scanning sensor</div>`)+engineCard('CrowdSec','♜',engineHealth.crowdsec?.status||ins.crowdsec.status,`<div class="engine-kpi">${(engineHealth.crowdsec?.status||ins.crowdsec.status)==='ok'?'Active':'Review'}</div><div class="tiny">Host intrusion decisions & firewall context</div>`);document.getElementById('incidents').innerHTML=incs.length?incs.slice(0,8).map(i=>`<div class="event"><div><strong class="${i.severity==='critical'?'bad':i.severity==='high'?'warn':''}">#${i.id} ${esc(i.container_name||'host')} · ${esc(i.severity).toUpperCase()}</strong><span class="tiny">${esc(i.title)} · ${esc((i.sources||[]).join(', '))}</span><div class="event-actions"><button onclick="openIncident(${i.id})">Investigate</button><button onclick="evidence(${i.id})">Capture Evidence</button><button onclick="resolveIncident(${i.id})">Resolve</button></div></div><span class="tag warn">${esc(i.status)}</span></div>`).join(''):'<div class="attention-ok">✓ No active incidents.</div>';document.getElementById('scoreExplain').innerHTML=(explain.contributors||[]).length?(explain.contributors||[]).slice(0,8).map(x=>`<div class="event"><div><strong>${esc(x.subject)}</strong><span class="tiny">${esc(x.detail)}</span></div><b>−${x.points_lost}</b></div>`).join(''):'<div class="attention-ok">✓ No active deductions.</div>';document.getElementById('leaderboard').innerHTML=(ss.leaderboard||[]).map(x=>`<tr class="clickable" onclick="openDrawer('${esc(x.container)}')"><td><b>${esc(x.container)}</b></td><td><b>${x.score}</b></td><td class="state ${x.score>=75?'good':x.score>=55?'warn':'bad'}">${esc(x.state).toUpperCase()}</td><td>${esc(x.profile)}</td><td class="tiny">${esc(x.factors[0])}</td></tr>`).join('');await loadActivity();drawHistory(hist);RECS=recs;document.getElementById('recommendations').innerHTML=recs.length?recs.slice(0,10).map((r,idx)=>`<div class="event recommend ${esc(r.priority)}"><div><strong>${esc(r.title)}</strong><span class="tiny">${esc(r.detail)}</span><div class="event-actions"><button onclick='recommendationAction(RECS[${idx}])'>${r.action==='scan'?'Scan Now':r.action==='incident'?'Investigate':r.action==='diagnose'?'Diagnose':r.action==='review-falco'?'Review Falco':'Review'}</button></div></div><span class="tag ${r.priority==='critical'||r.priority==='high'?'bad':r.priority==='medium'?'warn':'good'}">${esc(r.priority)}</span></div>`).join(''):'<div class="attention-ok">✓ No recommendations right now.</div>';document.getElementById('reporting').innerHTML=`<div class="kv"><b>Discord</b><span class="${ins.discord?.configured?'good':'muted'}">${ins.discord?.configured?'Configured':'Not configured'}</span></div><div class="kv"><b>n8n</b><span class="${ins.n8n?.configured?'good':'muted'}">${ins.n8n?.configured?'Configured':'Not configured'}</span></div><div class="kv"><b>Recent reports</b><span>${reph.length}</span></div>`;document.getElementById('containers').innerHTML=cs.map(c=>{let p=c.policy||{};return `<div class="container-row" onclick="openDrawer('${esc(c.name)}')"><div style="min-width:0"><b>${esc(c.name)}</b> <span class="tag ${c.state==='running'?'good':'bad'}">${esc(c.state)}</span><div class="tiny">${esc(c.image)} · ${esc(c.status)}</div><div class="policybar">${policyButton(c.name,'Approved Rebuild','allow_rebuild',!!p.allow_rebuild)}${policyButton(c.name,'Auto-Isolate','auto_isolate',!!p.auto_isolate)}${policyButton(c.name,'Auto-Restart','auto_restart',!!p.auto_restart)}${policyButton(c.name,'Auto-Update','auto_update',!!p.auto_update)}${policyButton(c.name,'Protected','protected',!!p.protected,'protected')}</div></div><div class="toolbar"><button onclick="event.stopPropagation();act('${esc(c.name)}','start')">Start</button><button onclick="event.stopPropagation();act('${esc(c.name)}','restart')">Restart</button><button class="danger" onclick="event.stopPropagation();act('${esc(c.name)}','stop')">Stop</button><button onclick="event.stopPropagation();scan('${esc(c.name)}')">Trivy</button><button onclick="event.stopPropagation();checkUpdate('${esc(c.name)}')">Update</button></div></div>`}).join('');document.getElementById('footerEval').textContent='Last full evaluation '+new Date(ss.evaluated_ts*1000).toLocaleTimeString()}
 if(TOKEN){load().then(()=>document.getElementById('login').classList.add('hidden')).catch(()=>{})}setInterval(()=>{if(TOKEN)load().catch(()=>{})},30000)
 </script></body></html>'''
 

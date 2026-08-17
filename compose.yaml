@@ -3,7 +3,7 @@ services:
     build:
       context: ./app
       dockerfile: Dockerfile
-    image: kingdom-manager:2.0.0
+    image: kingdom-manager:3.1.0
     container_name: kingdom-manager
     restart: unless-stopped
     environment:
@@ -25,6 +25,11 @@ services:
       KM_RECOVERY_ALLOW_DATABASES: "false"
       TRIVY_RUNNER: kingdom-manager-trivy
       DISCORD_WEBHOOK_URL: ""
+      KM_DASHBOARD_URL: "https://kingdom-manager-tail.kingdom.local"
+      DISCORD_MENTION_ROLE_ID: ""
+      DISCORD_NOTIFY_UPDATES: "true"
+      DISCORD_NOTIFY_RECOVERY: "true"
+      DISCORD_NOTIFY_SENSOR_FAILURES: "true"
       N8N_WEBHOOK_URL: ""
       CLAMAV_HOST: clamav
       CLAMAV_PORT: "3310"
@@ -50,6 +55,32 @@ services:
       KM_BASELINE_LEARNING_ATTENUATION: "8"
       KM_KNOWN_GOOD_RESIDUAL_RISK: "5"
       KM_KNOWN_GOOD_MAX_ATTENUATION: "45"
+      KM_SENSOR_FAILURE_GRACE_SECONDS: "120"
+      KM_PLAYBOOKS_ENABLED: "true"
+      KM_PLAYBOOK_AUTO_EVIDENCE: "true"
+      KM_PLAYBOOK_AUTO_SCAN: "true"
+      KM_PLAYBOOK_AUTO_ISOLATE: "false"
+      KM_PLAYBOOK_AUTO_RECOVER: "false"
+      KM_IGNORE_HTTP_TRANSPORT_ERRORS: "true"
+      KM_UPDATE_ENGINE_ENABLED: "true"
+      KM_UPDATE_CHECK_SECONDS: "21600"
+      KM_UPDATE_START_DELAY_SECONDS: "180"
+      KM_UPDATE_OBSERVATION_SECONDS: "60"
+      KM_UPDATE_REQUIRE_TRIVY: "true"
+      KM_UPDATE_BLOCK_CRITICAL_CVE: "true"
+      KM_UPDATE_BLOCK_HIGH_CVE: "false"
+      KM_UPDATE_AUTO_APPLY: "false"
+      KM_UPDATE_ALLOW_STATEFUL: "false"
+      KM_DRIFT_SCAN_ENABLED: "true"
+      KM_DRIFT_SCAN_SECONDS: "1800"
+      KM_BACKUP_MAX_AGE_HOURS: "48"
+      KM_AUTO_SAFE_PLAYBOOKS: "true"
+      KM_ROLLBACK_RETENTION: "10"
+      # Optional Portainer compose capture. Leave blank unless configured.
+      PORTAINER_URL: ""
+      PORTAINER_API_KEY: ""
+      PORTAINER_STACK_ID: ""
+      KM_COMPOSE_SNAPSHOT_PATH: ""
     volumes:
       - kingdom-manager-data:/data
     networks:
@@ -90,7 +121,7 @@ services:
       VERSION: 1
       POST: 1
       DELETE: 0
-      EXEC: 1
+      EXEC: 0
       BUILD: 0
       COMMIT: 0
       CONFIGS: 0
