@@ -3,7 +3,7 @@ services:
     build:
       context: ./app
       dockerfile: Dockerfile
-    image: kingdom-manager:3.1.0
+    image: kingdom-manager:3.1.1
     container_name: kingdom-manager
     restart: unless-stopped
     environment:
@@ -24,6 +24,11 @@ services:
       KM_RECOVERY_BLOCK_ON_CRITICAL_CVE: "true"
       KM_RECOVERY_ALLOW_DATABASES: "false"
       TRIVY_RUNNER: kingdom-manager-trivy
+      TRIVY_EXEC_DOCKER_HOST: tcp://trivy-exec-proxy:2375
+      KM_DOCKER_CACHE_TTL_SECONDS: "12"
+      KM_DOCKER_CACHE_MAX_STALE_SECONDS: "300"
+      KM_SENSOR_CACHE_TTL_SECONDS: "15"
+      KM_API_SNAPSHOT_TTL_SECONDS: "10"
       DISCORD_WEBHOOK_URL: ""
       KM_DASHBOARD_URL: "https://kingdom-manager-tail.kingdom.local"
       DISCORD_MENTION_ROLE_ID: ""
@@ -92,6 +97,8 @@ services:
         condition: service_started
       recovery-socket-proxy:
         condition: service_started
+      trivy-exec-proxy:
+        condition: service_started
       trivy-runner:
         condition: service_started
     healthcheck:
@@ -155,6 +162,39 @@ services:
       POST: 1
       DELETE: 1
       EXEC: 0
+      BUILD: 0
+      COMMIT: 0
+      CONFIGS: 0
+      DISTRIBUTION: 0
+      NODES: 0
+      PLUGINS: 0
+      SECRETS: 0
+      SESSION: 0
+      SWARM: 0
+      SYSTEM: 0
+      VOLUMES: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - kingdom-manager-internal
+    security_opt:
+      - no-new-privileges:true
+
+  trivy-exec-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: kingdom-manager-trivy-exec-api
+    restart: unless-stopped
+    environment:
+      CONTAINERS: 1
+      IMAGES: 0
+      INFO: 0
+      NETWORKS: 0
+      EVENTS: 0
+      PING: 1
+      VERSION: 1
+      POST: 1
+      DELETE: 0
+      EXEC: 1
       BUILD: 0
       COMMIT: 0
       CONFIGS: 0

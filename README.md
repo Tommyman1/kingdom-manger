@@ -1,4 +1,4 @@
-# Kingdom Manager v3.1.0 LTS
+# Kingdom Manager v3.1.1 LTS
 
 Kingdom Manager is a self-hosted Docker security and lifecycle control plane for a private homelab. v3.1 LTS consolidates the v3 update/rollback engine with disaster recovery validation, configuration drift detection, dependency mapping, backup-awareness, system simulation/validation, automated safe incident playbooks, and richer Discord notifications.
 
@@ -55,3 +55,23 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 ```
 
 Then test Discord from the dashboard and perform one staged update + rollback on a disposable Ring-1 service.
+
+## v3.1.1 Reliability & UI Audit
+
+v3.1.1 hardens the v3.1 LTS control plane without changing the database schema.
+
+Key changes:
+- Lightweight `/api/auth/verify` unlock path; login no longer waits for Docker inventory or score evaluation.
+- Shared persistent Docker HTTP client with bounded connection pooling and safe GET-only retry.
+- Cached running/full container inventory with last-good fallback during transient Docker timeouts.
+- Cached core sensor probes and short-lived security-score snapshots to eliminate duplicate expensive work.
+- Progressive dashboard loading: core security state renders even if secondary history/report/container calls are delayed.
+- Non-JSON proxy/backend responses are detected and reported clearly instead of producing `Unexpected token '<'`.
+- Duplicate action guards, disabled/loading button states, and consistent button styling.
+- Incident Investigate no longer triggers a second full dashboard refresh merely by marking the incident investigating.
+- Incident `Scan Now`, evidence capture, and safe playbook calls have long-operation timeouts and explicit progress state.
+- Dedicated `trivy-exec-proxy` restores Trivy command execution while keeping `EXEC=0` on the general Docker proxy.
+- New `/api/system/performance` endpoint exposes cache age/coverage for troubleshooting.
+
+### Deployment note
+Keep your existing `kingdom-manager-data` and `kingdom-manager-trivy-cache` volumes. If your live compose contains Discord/CrowdSec credentials, copy those values into the v3.1.1 compose (or preferably an env/secrets mechanism) before redeploying; the distributed compose intentionally contains placeholders.

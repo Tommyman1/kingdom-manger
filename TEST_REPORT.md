@@ -1,4 +1,4 @@
-# Kingdom Manager v3.1.0 LTS validation report
+# Kingdom Manager v3.1.1 LTS validation report
 
 ## Offline/package validation performed
 

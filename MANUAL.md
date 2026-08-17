@@ -1,6 +1,6 @@
 # Kingdom Manager v3.1 LTS - Operations Manual
 
-**Release:** 3.1.0 LTS  
+**Release:** 3.1.1 LTS  
 **Purpose:** Self-hosted Docker security intelligence, lifecycle control, staged updates, incident orchestration, recovery, rollback, configuration drift detection, validation, and reporting.
 
 > Kingdom Manager is designed to automate observation, evidence collection, vulnerability checks, low-risk playbook steps, update staging, and notifications. Destructive actions remain policy/approval gated by default.
@@ -105,7 +105,7 @@ You can also back up the Docker volume using your normal host backup system.
 The included `compose.yaml` uses:
 
 ```yaml
-image: kingdom-manager:3.1.0
+image: kingdom-manager:3.1.1
 ```
 
 Keep your existing secrets and keys. In particular, do not replace your real CrowdSec bouncer key with a blank placeholder.
