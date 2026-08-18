@@ -17,7 +17,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-VERSION = "3.2.11"
+VERSION = "3.2.12"
 app = FastAPI(title="Kingdom Manager", version=VERSION)
 
 DOCKER = os.getenv("DOCKER_HOST", "tcp://docker-socket-proxy:2375").replace("tcp://", "http://")
@@ -1307,6 +1307,25 @@ async def security_event(request: Request, authorization: str | None = Header(de
     return {"ok": True, "decision": decision}
 
 
+
+async def _falco_background_decision(*args, **kwargs):
+    """Run Falco correlation outside the webhook response path.
+
+    Falco's HTTP output has a short timeout. The webhook must acknowledge quickly
+    after authentication + event persistence, then perform heavier correlation in
+    the background so Falco's output queue cannot be blocked by Kingdom analysis.
+    """
+    try:
+        await decision_for_security(*args, **kwargs)
+    except Exception as e:
+        try:
+            event('falco', 'kingdom-manager', {
+                'state':'background-decision-error',
+                'error':f'{type(e).__name__}: {e}'
+            }, 'warning')
+        except Exception:
+            pass
+
 @app.post("/api/security/falco")
 async def falco_webhook(request: Request, token: str = ""):
     # Falco posts here directly over the private security network.
@@ -1325,7 +1344,7 @@ async def falco_webhook(request: Request, token: str = ""):
         c.execute("INSERT INTO security_events(ts,source,severity,container_name,message,raw_json) VALUES(?,?,?,?,?,?)",
                   (now(), "falco", severity, name, msg, json.dumps(data, default=str)[:100000]))
     invalidate_security_snapshot()
-    return await decision_for_security("falco", severity, name, msg)
+    return asyncio.create_task(_falco_background_decision("falco", severity, name, msg))
 
 
 @app.post("/api/containers/{name}/isolate")
