@@ -17,7 +17,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-VERSION = "3.2.10"
+VERSION = "3.2.11"
 app = FastAPI(title="Kingdom Manager", version=VERSION)
 
 DOCKER = os.getenv("DOCKER_HOST", "tcp://docker-socket-proxy:2375").replace("tcp://", "http://")
@@ -2567,7 +2567,7 @@ async def update_apply(plan_id: int, authorization: str|None=Header(default=None
     if pol.get('local_build'): raise HTTPException(409,'Local Build containers must be rebuilt from source, not registry-updated')
     if risk_profile(name).get('profile') in {'database','security','critical-infrastructure'} and p['status'] not in {'verified','verified-risk-reduction'}:
         raise HTTPException(409,'Critical service update must be verified first')
-    if p['status'] not in {'verified','available'}:
+    if p['status'] not in {'verified','available', 'verified-risk-reduction'}:
         raise HTTPException(409,'Update plan is not ready')
     with conn() as c:
         snap=c.execute('SELECT * FROM config_snapshots WHERE id=?',(p['snapshot_id'],)).fetchone()
