@@ -3,7 +3,7 @@ services:
     build:
       context: ./app
       dockerfile: Dockerfile
-    image: kingdom-manager:3.2.1
+    image: kingdom-manager:3.2.2
     container_name: kingdom-manager
     restart: unless-stopped
     environment:
@@ -80,6 +80,7 @@ services:
       KM_UPDATE_REQUIRE_TRIVY: "true"
       KM_UPDATE_BLOCK_CRITICAL_CVE: "true"
       KM_UPDATE_BLOCK_HIGH_CVE: "false"
+      KM_UPDATE_ALLOW_RISK_REDUCTION: "true"
       KM_UPDATE_AUTO_APPLY: "true"
       KM_UPDATE_ALLOW_STATEFUL: "false"
       KM_DRIFT_SCAN_ENABLED: "true"
