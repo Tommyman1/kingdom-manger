@@ -105,7 +105,7 @@ You can also back up the Docker volume using your normal host backup system.
 The included `compose.yaml` uses:
 
 ```yaml
-image: kingdom-manager:3.1.1
+image: kingdom-manager:3.1.2
 ```
 
 Keep your existing secrets and keys. In particular, do not replace your real CrowdSec bouncer key with a blank placeholder.
