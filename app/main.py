@@ -16,7 +16,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-VERSION = "3.2.2"
+VERSION = "3.2.4"
 app = FastAPI(title="Kingdom Manager", version=VERSION)
 
 DOCKER = os.getenv("DOCKER_HOST", "tcp://docker-socket-proxy:2375").replace("tcp://", "http://")
@@ -110,7 +110,7 @@ DRIFT_SCAN_ENABLED = os.getenv("KM_DRIFT_SCAN_ENABLED", "true").lower() in {"1",
 DRIFT_SCAN_SECONDS = int(os.getenv("KM_DRIFT_SCAN_SECONDS", "1800"))
 BACKUP_MAX_AGE_HOURS = int(os.getenv("KM_BACKUP_MAX_AGE_HOURS", "48"))
 AUTO_SAFE_PLAYBOOKS = os.getenv("KM_AUTO_SAFE_PLAYBOOKS", "true").lower() in {"1","true","yes","on"}
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -219,7 +219,7 @@ def init_db() -> None:
         """)
     _migrate_events_if_needed()
     with conn() as c:
-        for name, decl in {'auto_restart':'INTEGER NOT NULL DEFAULT 1','auto_update':'INTEGER NOT NULL DEFAULT 0','auto_isolate':'INTEGER NOT NULL DEFAULT 0','allow_rebuild':'INTEGER NOT NULL DEFAULT 0','protected':'INTEGER NOT NULL DEFAULT 0','local_build':'INTEGER NOT NULL DEFAULT 0','idle_cpu':'REAL NOT NULL DEFAULT 3.0','idle_minutes':'INTEGER NOT NULL DEFAULT 20','criticality':"TEXT NOT NULL DEFAULT 'normal'",'update_ring':'INTEGER NOT NULL DEFAULT 2','require_backup':'INTEGER NOT NULL DEFAULT 1'}.items():
+        for name, decl in {'auto_restart':'INTEGER NOT NULL DEFAULT 1','auto_update':'INTEGER NOT NULL DEFAULT 0','auto_isolate':'INTEGER NOT NULL DEFAULT 0','allow_rebuild':'INTEGER NOT NULL DEFAULT 0','protected':'INTEGER NOT NULL DEFAULT 0','local_build':'INTEGER NOT NULL DEFAULT 0','allow_stateful_update':'INTEGER NOT NULL DEFAULT 0','idle_cpu':'REAL NOT NULL DEFAULT 3.0','idle_minutes':'INTEGER NOT NULL DEFAULT 20','criticality':"TEXT NOT NULL DEFAULT 'normal'",'update_ring':'INTEGER NOT NULL DEFAULT 2','require_backup':'INTEGER NOT NULL DEFAULT 1'}.items():
             _ensure_column(c, 'policies', name, decl)
         _ensure_column(c, 'suppressions', 'expires_ts', 'INTEGER')
         _ensure_column(c, 'suppressions', 'created_ts', 'INTEGER')
@@ -567,24 +567,57 @@ def _risk_points(scan: dict) -> int:
 def _compare_scans(current: dict, candidate: dict) -> dict:
     cur={_vuln_key(x):x for x in current.get("findings") or [] if _vuln_key(x)!="|"}
     cand={_vuln_key(x):x for x in candidate.get("findings") or [] if _vuln_key(x)!="|"}
-    fixed=[cur[k] for k in cur.keys()-cand.keys()]
-    introduced=[cand[k] for k in cand.keys()-cur.keys()]
-    remaining=[cand[k] for k in cand.keys()&cur.keys()]
-    cp=_risk_points(current); np=_risk_points(candidate)
-    safer=(int(candidate.get("critical",0) or 0)<int(current.get("critical",0) or 0)
-           or (int(candidate.get("critical",0) or 0)==int(current.get("critical",0) or 0)
-               and int(candidate.get("high",0) or 0)<int(current.get("high",0) or 0))
-           or (cp>0 and np<cp))
+
+    fixed_keys=cur.keys()-cand.keys()
+    introduced_keys=cand.keys()-cur.keys()
+    remaining_keys=cand.keys()&cur.keys()
+
+    fixed=[cur[k] for k in fixed_keys]
+    introduced=[cand[k] for k in introduced_keys]
+    remaining=[cand[k] for k in remaining_keys]
+
+    def unique_counts(d: dict) -> dict:
+        vals=list(d.values())
+        return {
+            "critical":sum(1 for x in vals if x.get("severity")=="critical"),
+            "high":sum(1 for x in vals if x.get("severity")=="high"),
+            "medium":sum(1 for x in vals if x.get("severity")=="medium"),
+            "low":sum(1 for x in vals if x.get("severity")=="low"),
+            "total":len(vals),
+        }
+
+    cur_counts=unique_counts(cur)
+    cand_counts=unique_counts(cand)
+
+    # Score unique CVE/package pairs so duplicate targets don't inflate risk.
+    cp=cur_counts["critical"]*10000 + cur_counts["high"]*100 + cur_counts["medium"]
+    np=cand_counts["critical"]*10000 + cand_counts["high"]*100 + cand_counts["medium"]
+
+    safer=(
+        cand_counts["critical"] < cur_counts["critical"]
+        or (cand_counts["critical"] == cur_counts["critical"] and cand_counts["high"] < cur_counts["high"])
+        or (cp>0 and np<cp)
+    )
     pct=round(((cp-np)/cp)*100,1) if cp>0 else (100.0 if np==0 else 0.0)
+
     order={"critical":0,"high":1,"medium":2,"low":3}
     sorter=lambda x:(order.get(x.get("severity"),9),x.get("pkg_name",""),x.get("vuln_id",""))
+
     return {
-        "current":{"critical":current.get("critical",0),"high":current.get("high",0),"medium":current.get("medium",0),"total":current.get("total",0),"risk_points":cp},
-        "candidate":{"critical":candidate.get("critical",0),"high":candidate.get("high",0),"medium":candidate.get("medium",0),"total":candidate.get("total",0),"risk_points":np},
-        "safer":bool(safer),"risk_reduction_percent":pct,
-        "fixable_now_count":len(fixed),"remaining_count":len(remaining),"introduced_count":len(introduced),
-        "fixed_findings":sorted(fixed,key=sorter),"remaining_findings":sorted(remaining,key=sorter),"introduced_findings":sorted(introduced,key=sorter),
+        "current":{**cur_counts,"risk_points":cp},
+        "candidate":{**cand_counts,"risk_points":np},
+        "safer":bool(safer),
+        "risk_reduction_percent":pct,
+        "removed_count":len(fixed),
+        "remaining_count":len(remaining),
+        "introduced_count":len(introduced),
+        # Backward-compatible alias used by older UI code.
+        "fixable_now_count":len(fixed),
+        "fixed_findings":sorted(fixed,key=sorter),
+        "remaining_findings":sorted(remaining,key=sorter),
+        "introduced_findings":sorted(introduced,key=sorter),
     }
+
 
 async def trivy_scan(name: str) -> dict:
     obj = await inspect_container(name)
@@ -1240,7 +1273,7 @@ async def manual_sample(name: str, authorization: str | None = Header(default=No
 async def set_policy(name: str, request: Request, authorization: str | None = Header(default=None)):
     require_token(authorization)
     data = await request.json()
-    allowed = {"auto_restart", "auto_update", "auto_isolate", "allow_rebuild", "protected", "local_build", "idle_cpu", "idle_minutes", "criticality", "update_ring", "require_backup"}
+    allowed = {"auto_restart", "auto_update", "auto_isolate", "allow_rebuild", "protected", "local_build", "allow_stateful_update", "idle_cpu", "idle_minutes", "criticality", "update_ring", "require_backup"}
     current = default_policy(name)
     for k, v in data.items():
         if k in allowed:
@@ -1249,7 +1282,7 @@ async def set_policy(name: str, request: Request, authorization: str | None = He
         c.execute("""UPDATE policies SET auto_restart=?,auto_update=?,auto_isolate=?,allow_rebuild=?,protected=?,idle_cpu=?,idle_minutes=? WHERE container_name=?""",
                   (int(bool(current["auto_restart"])), int(bool(current["auto_update"])), int(bool(current["auto_isolate"])),
                    int(bool(current["allow_rebuild"])), int(bool(current["protected"])), float(current["idle_cpu"]), int(current["idle_minutes"]), name))
-        c.execute("UPDATE policies SET criticality=?,update_ring=?,require_backup=?,local_build=? WHERE container_name=?",(str(current.get("criticality","normal")),max(1,min(4,int(current.get("update_ring",2)))),int(bool(current.get("require_backup",1))),int(bool(current.get("local_build",0))),name))
+        c.execute("UPDATE policies SET criticality=?,update_ring=?,require_backup=?,local_build=?,allow_stateful_update=? WHERE container_name=?",(str(current.get("criticality","normal")),max(1,min(4,int(current.get("update_ring",2)))),int(bool(current.get("require_backup",1))),int(bool(current.get("local_build",0))),int(bool(current.get("allow_stateful_update",0))),name))
     event("policy", name, data)
     return default_policy(name)
 
@@ -2541,9 +2574,10 @@ async def update_apply(plan_id: int, authorization: str|None=Header(default=None
         raise HTTPException(409,'Rollback preflight failed: '+str(preflight.get('reason')))
 
     obj=json.loads(snap['inspect_json']); mounts=obj.get('Mounts') or []
-    if mounts and not UPDATE_ALLOW_STATEFUL:
-        raise HTTPException(409,'Stateful container has mounts/volumes. Automatic image rollback cannot reverse data migrations; set KM_UPDATE_ALLOW_STATEFUL=true only after validating application-data backups.')
-    if mounts and UPDATE_ALLOW_STATEFUL and pol.get('require_backup'):
+    stateful_allowed=bool(UPDATE_ALLOW_STATEFUL or pol.get('allow_stateful_update'))
+    if mounts and not stateful_allowed:
+        raise HTTPException(409,'Stateful container has mounts/volumes. Enable this container\'s Allow Stateful Update policy after validating its application-data backup. Image rollback cannot reverse data migrations.')
+    if mounts and stateful_allowed and pol.get('require_backup'):
         with conn() as c:
             b=c.execute('SELECT verified_ts,provider FROM backup_status WHERE container_name=?',(name,)).fetchone()
         if not b or now()-int(b['verified_ts'])>BACKUP_MAX_AGE_HOURS*3600:
@@ -2645,7 +2679,7 @@ async def update_automation_status(authorization: str|None=Header(default=None))
     rows=[]
     for x in cs:
         p=default_policy(x['name']); profile=risk_profile(x['name']).get('profile')
-        rows.append({'container':x['name'],'auto_update':bool(p.get('auto_update')),'local_build':bool(p.get('local_build')),'protected':bool(p.get('protected')),'ring':int(p.get('update_ring') or 2),'profile':profile,'portainer_api_configured':bool(PORTAINER_URL and PORTAINER_API_KEY),'automatic_apply_eligible':bool(UPDATE_AUTO_APPLY and p.get('auto_update') and not p.get('local_build') and not p.get('protected') and int(p.get('update_ring') or 2)<=2)})
+        rows.append({'container':x['name'],'auto_update':bool(p.get('auto_update')),'local_build':bool(p.get('local_build')),'allow_stateful_update':bool(p.get('allow_stateful_update')),'protected':bool(p.get('protected')),'ring':int(p.get('update_ring') or 2),'profile':profile,'portainer_api_configured':bool(PORTAINER_URL and PORTAINER_API_KEY),'automatic_apply_eligible':bool(UPDATE_AUTO_APPLY and p.get('auto_update') and not p.get('local_build') and not p.get('protected') and int(p.get('update_ring') or 2)<=2)})
     return {'enabled':UPDATE_ENGINE_ENABLED,'global_auto_apply':UPDATE_AUTO_APPLY,'stateful_auto_apply':UPDATE_ALLOW_STATEFUL,'require_trivy':UPDATE_REQUIRE_TRIVY,'block_critical':UPDATE_BLOCK_CRITICAL,'block_high':UPDATE_BLOCK_HIGH,'containers':rows}
 
 
@@ -2992,7 +3026,17 @@ async def remediation_plan(name: str, authorization: str|None=Header(default=Non
         b=c.execute('SELECT verified_ts,provider,detail FROM backup_status WHERE container_name=?',(name,)).fetchone()
         if b: backup=dict(b)
     backup_fresh=bool(backup and now()-int(backup['verified_ts'])<=BACKUP_MAX_AGE_HOURS*3600)
-    stateful_gate={'has_mounts':bool(mounts),'global_stateful_updates_enabled':UPDATE_ALLOW_STATEFUL,'backup_required':bool(mounts and policy.get('require_backup')),'backup_fresh':backup_fresh}
+    stateful_gate={
+        'has_mounts':bool(mounts),
+        'global_stateful_updates_enabled':UPDATE_ALLOW_STATEFUL,
+        'container_stateful_update_allowed':bool(policy.get('allow_stateful_update')),
+        'effective_stateful_update_allowed':bool(UPDATE_ALLOW_STATEFUL or policy.get('allow_stateful_update')),
+        'backup_required':bool(mounts and policy.get('require_backup')),
+        'backup_fresh':backup_fresh,
+        'backup_provider':backup.get('provider') if backup else None,
+        'backup_verified_ts':backup.get('verified_ts') if backup else None,
+        'backup_age_seconds':(now()-int(backup['verified_ts'])) if backup else None,
+    }
     if policy.get('local_build'):
         fixable=[x for x in current.get('findings') or [] if str(x.get('fixed_version') or '').strip()]
         return {'container':name,'mode':'local-build','current':{k:v for k,v in current.items() if k!='findings'},'fixable_count':len(fixable),'remaining_count':len(current.get('findings') or []),'action':'source-rebuild-required','stateful_gate':stateful_gate,'findings':current.get('findings') or []}
@@ -3404,12 +3448,63 @@ button:disabled{opacity:.46;cursor:not-allowed;filter:saturate(.5)}
 
 /* v3.2.0 Local Build policy */
 .policybtn.localbuild.on{border-color:#8b5cf6;background:rgba(139,92,246,.14);color:#c4b5fd}
+.policybtn.stateful.on{border-color:#d97706;background:rgba(217,119,6,.14);color:#fdba74}
 .btn-local{border:1px solid #7c3aed;background:rgba(124,58,237,.13);color:#c4b5fd;min-height:36px;padding:7px 12px;border-radius:9px;font-weight:750}
 .btn-local:hover{background:rgba(124,58,237,.24);border-color:#a78bfa;color:#ede9fe}
 
 /* v3.2.2 remediation center */
 .vuln-row{padding:12px 0;border-bottom:1px solid #173244}
 .vuln-row:last-child{border-bottom:0}
+
+/* v3.2.4 remediation readability */
+.remed-shell{display:flex;flex-direction:column;gap:14px;text-align:left}
+.remed-hero{display:flex;justify-content:space-between;gap:18px;align-items:flex-start;padding-bottom:10px;border-bottom:1px solid #173244}
+.remed-hero h3{margin:3px 0 2px;font-size:22px}
+.eyebrow{font-size:10px;letter-spacing:.14em;color:#62bfe8;font-weight:800}
+.risk-badge{min-width:115px;border:1px solid #24465b;border-radius:12px;padding:10px 12px;text-align:center;background:rgba(10,34,47,.5)}
+.risk-badge span{display:block;font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:#90a9b9}
+.risk-badge b{display:block;font-size:24px;margin-top:2px}
+.remed-compare{display:grid;grid-template-columns:1fr auto 1fr;gap:12px;align-items:center}
+.remed-card{border:1px solid #213c4f;border-radius:12px;padding:13px;background:rgba(7,25,35,.45)}
+.remed-card.candidate{border-color:#28536a}
+.remed-card-title{font-size:11px;letter-spacing:.12em;font-weight:800;color:#9bb3c2;margin-bottom:10px}
+.remed-arrow{font-size:22px;color:#5c8298}
+.remed-severity-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.remed-sev{border:1px solid #203947;border-radius:9px;padding:8px;text-align:center}
+.remed-sev span{display:block;font-size:10px;color:#91a7b5}
+.remed-sev b{font-size:19px}
+.remed-sev.critical b{color:#ff7272}.remed-sev.high b{color:#f7ad59}.remed-sev.medium b{color:#e0d16a}
+.remed-impact-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.impact-card{border:1px solid #203947;border-radius:10px;padding:10px 12px}
+.impact-card span{display:block;font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:#90a9b9}
+.impact-card b{display:block;font-size:23px;margin-top:2px}
+.data-safety-card{border:1px solid #2d5065;border-radius:12px;padding:13px;background:rgba(13,42,57,.34)}
+.data-safety-head{display:flex;justify-content:space-between;align-items:center;font-weight:800;margin-bottom:7px}
+.safety-row{display:grid;grid-template-columns:22px 1fr;gap:8px;padding:8px 0;border-top:1px solid #1c3949}
+.safety-row:first-of-type{border-top:0}
+.remed-callout{border:1px solid #29495a;border-radius:10px;padding:11px 12px;margin-top:12px;text-align:left}
+.remed-callout.good{border-color:#17663b;background:rgba(16,95,52,.12)}
+.remed-callout.warn{border-color:#7c5a18;background:rgba(128,91,18,.12)}
+.remed-callout.bad{border-color:#7d3030;background:rgba(125,48,48,.12)}
+.remed-callout b{display:block;margin-bottom:4px}
+.vuln-toolbar{position:sticky;top:0;z-index:2;background:#081923;padding-bottom:12px}
+.vuln-kpis{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:10px}
+.vuln-kpis>div{border:1px solid #203947;border-radius:9px;padding:8px 10px}
+.vuln-kpis span{display:block;font-size:10px;color:#90a9b9;text-transform:uppercase}
+.vuln-kpis b{font-size:20px}
+.vuln-row{padding:13px 0;border-bottom:1px solid #173244}
+.vuln-row-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.vuln-package{font-size:11px;color:#8fa8b7}
+.vuln-title{margin:7px 0 6px;line-height:1.4}
+.vuln-fix{font-size:12px}
+@media(max-width:720px){
+  .remed-compare{grid-template-columns:1fr}
+  .remed-arrow{transform:rotate(90deg);text-align:center}
+  .remed-impact-grid,.vuln-kpis{grid-template-columns:1fr}
+  .remed-hero{flex-direction:column}
+  .risk-badge{width:100%}
+}
+
 </style></head><body>
 <div id="toastbox" class="toastbox"></div>
 <div id="kmModal" class="modalback hidden"><div class="modalbox"><h3 id="kmModalTitle">Kingdom Manager</h3><div id="kmModalText" class="muted"></div><input id="kmModalInput" class="hidden"><div class="modal-actions"><button id="kmModalCancel">Cancel</button><button id="kmModalOk">Continue</button></div></div></div>
@@ -3427,15 +3522,72 @@ let TOKEN=localStorage.getItem('km_token')||'',ACTIVITY_FILTER='',RECS=[];const 
 async function incidentStatus(id,status,refresh=true){await api(`/api/incidents/${id}/status`,{method:'POST',body:JSON.stringify({status})});if(refresh)await load()}async function createRecovery(n,incidentId){try{let p=await api(`/api/recovery/plan/${encodeURIComponent(n)}`,{method:'POST',body:JSON.stringify({incident_id:incidentId})});let yes=await kmDialog({title:`Approve recovery plan #${p.plan_id}?`,text:`${n}: capture evidence → isolate → quarantine replacement → Trivy verification → recreate → health observation.`,ok:'Approve & Run',danger:true});if(!yes)return;let r=await api(`/api/recovery/${p.plan_id}/approve-and-run`,{method:'POST'});toast(r.ok?'Recovery completed successfully.':`Recovery stopped safely: ${r.reason||'review required'}`,r.ok?'ok':'warn');load();if(incidentId)openIncident(incidentId);else openDrawer(n)}catch(e){toast(e.message,'error')}}async function markIncidentExpected(id,rule,n){let p=await api('/api/suppressions/preview',{method:'POST',body:JSON.stringify({source:'falco',container_name:n,rule_contains:rule})});let preview=`NARROW SCOPE ONLY\n${p.scope}\n\nMatches in last 24h: ${p.matching_events_24h}\nCurrent container risk context: ${p.estimated_current_risk_points} points\n\nThis will NOT suppress the rule globally.`;let ok=await kmDialog({title:'Suppression impact preview',text:preview,ok:'Continue'});if(!ok)return;let expiry=await kmDialog({title:'Suppression duration',text:'Enter hours. Examples: 24 = 1 day, 168 = 7 days, 0 = permanent.',input:true,value:'168',ok:'Continue'});if(expiry===null)return;let reason=await kmDialog({title:'Reason for known-good behavior',text:`Scope: ${p.scope}`,input:true,value:'Known-good behavior for this container',ok:'Save suppression'});if(!reason)return;await api(`/api/incidents/${id}/mark-expected`,{method:'POST',body:JSON.stringify({rule,reason,expires_hours:Number(expiry)||0})});toast(`Known-good scope saved for ${n}: ${rule}`);closeDrawer();load()}async function runSafePlaybook(id){return guarded('playbook:'+id,'Running playbook',async()=>{try{toast('Running safe Kingdom playbook steps…','warn');let r=await api(`/api/incidents/${id}/playbook/run-safe`,{method:'POST',timeout:900000});toast(r.ok?'Safe playbook completed':'Playbook completed with warnings',r.ok?'ok':'warn');await load();await openIncident(id);return r}catch(e){toast(e.message,'error');throw e}})}async function isolateIncident(id){if(!(await kmDialog({title:'Isolate incident container?',text:'Kingdom Manager will remove the container from its current service networks and place it in quarantine.',ok:'Isolate',danger:true})))return;try{await api(`/api/incidents/${id}/isolate`,{method:'POST'});toast('Incident container isolated','warn');openIncident(id);load()}catch(e){toast(e.message,'error')}}async function openIncident(id){try{await incidentStatus(id,'investigating',false);let [inc,a,pb]=await Promise.all([api(`/api/incidents/${id}`),api(`/api/incidents/${id}/investigation`),api(`/api/incidents/${id}/playbook`)]);let n=inc.container_name||'',cls=a.classification||'unverified',tone=cls==='high-confidence-threat'?'bad':cls==='suspicious'?'warn':cls==='likely-expected'?'good':'';document.getElementById('drawerTitle').textContent=`Incident #${id} · ${n||'host'}`;document.getElementById('drawerSubtitle').textContent=`${inc.severity.toUpperCase()} · ${inc.status} · Kingdom assessment ${a.confidence}%`;let rules=(a.falco_rules||[]).map(x=>{let samples=(x.samples||[]).filter(z=>z.proc_exe||z.process||z.cmdline||z.image||z.user||z.fd).map(z=>`<div class="falco-sample tiny"><b>Observed</b>${z.proc_exe?` · exe ${esc(z.proc_exe)}`:''}${z.process?` · process ${esc(z.process)}`:''}${z.parent?` · parent ${esc(z.parent)}`:''}${z.user?` · user ${esc(z.user)}`:''}${z.image?`<br>image ${esc(z.image)}`:''}${z.cmdline?`<br>cmd ${esc(z.cmdline).slice(0,180)}`:''}${z.fd?`<br>fd ${esc(z.fd).slice(0,180)}`:''}</div>`).join('');return `<div class="event"><div><strong>${esc(x.rule)}</strong><span class="tiny">${x.count} matching events · first ${new Date(x.first_ts*1000).toLocaleString()} · last ${new Date(x.last_ts*1000).toLocaleString()}</span>${samples}</div><span class="tag ${x.severity==='critical'?'bad':'warn'}">${esc(x.severity)}</span></div>`}).join('')||'<div class="tiny">No Falco rules in the last 24h.</div>';let factors=(a.factors||[]).map(x=>`<div class="tiny" style="padding:5px 0">• ${esc(x)}</div>`).join('');let math=(a.confidence_math||[]).map(x=>`<div class="event"><span class="tiny">${esc(x.reason)}</span><b class="${x.points>=0?'good':'warn'}">${x.points>=0?'+':''}${x.points}%</b></div>`).join('')||'<div class="tiny">No confidence adjustments recorded.</div>';let scan=a.latest_scan?`Last successful · ${a.latest_scan.critical} critical · ${a.latest_scan.high} high · ${a.latest_scan.medium} medium · ${age(Math.max(0,Math.floor(Date.now()/1000)-a.latest_scan.ts))}`:'No successful scan';if(a.latest_scan_attempt&&a.latest_scan_attempt.status!=='ok')scan+=`<br><span class=\"bad\">Latest attempt: SCAN ERROR</span>`;let allow=!!a.recovery_available,top=a.top_rule||'',expected=!!a.expected_rule,recovery=(a.recovery_reasons||[]).map(x=>`<div class="tiny warn">• ${esc(x)}</div>`).join('');document.getElementById('drawerBody').innerHTML=`<section><h3>🧭 RESPONSE PLAYBOOK</h3><div class="tiny">${esc(pb.name||'Kingdom adaptive response')} · safe automation ${pb.enabled?'enabled':'disabled'}</div>${(pb.steps||[]).map((x,i)=>`<div class="event"><div><strong>${i+1}. ${esc(x.title)}</strong><span class="tiny">gate: ${esc(x.gate)}${x.auto_eligible?' · auto-eligible':''}${x.destructive?' · destructive':''}</span></div><span class="tag ${x.destructive?'bad':x.auto_eligible?'good':'warn'}">${x.destructive?'APPROVAL':x.auto_eligible?'SAFE AUTO':x.gate.toUpperCase()}</span></div>`).join('')}<div class="toolbar" style="margin-top:10px"><button class="btn-primary" onclick="runSafePlaybook(${id})">Run Safe Steps</button>${allow?`<button class="danger" onclick="createRecovery('${esc(n)}',${id})">Prepare Approved Recovery</button>`:''}</div></section><section><h3>KINGDOM INTELLIGENCE</h3><p>${esc(a.intelligence_summary||a.summary)}</p><div class="kv"><b>Suggested action</b><span>${esc((a.recommended_action||'continue-investigation').replaceAll('-',' '))}</span></div></section><section><h3>KINGDOM ASSESSMENT</h3><div class="kv"><b>Classification</b><span class="${tone}">${esc(cls).replaceAll('-',' ').toUpperCase()}</span></div><div class="kv"><b>Confidence</b><span>${a.confidence}% ${a.confidence_delta?`(${a.confidence_delta>0?'+':''}${a.confidence_delta} since last assessment)`:''}</span></div><div class="kv"><b>Server score delta</b><span>${a.score_delta>0?'+':''}${a.score_delta||0}</span></div><p class="muted">${esc(a.summary)}</p>${factors}<h4>WHY THIS CONFIDENCE?</h4>${math}</section><section><h3>CORROBORATION</h3><div class="kv"><b>Falco match scope</b><span>${a.matching_falco_events||0} matching events for this incident rule</span></div><div class="kv"><b>Falco total</b><span>${a.falco_total_24h||0} total events across Kingdom (24h)</span></div><div class="kv"><b>Trivy</b><span>${esc(scan)}</span></div><div class="kv"><b>ClamAV</b><span>${a.source_counts?.clamav?'Evidence present':'No correlated evidence'}</span></div><div class="kv"><b>CrowdSec</b><span>${a.source_counts?.crowdsec?'Evidence present':'No correlated evidence'}</span></div></section><section><h3>ADAPTIVE BASELINE</h3><div class="kv"><b>State</b><span class="${a.baseline?.status==='stable'?'good':a.baseline?.status==='novel'?'warn':''}">${esc((a.baseline?.status||'unknown').toUpperCase())}</span></div><div class="kv"><b>Observed</b><span>${a.baseline?.count||0} matching events across ${a.baseline?.span_hours||0}h</span></div><div class="kv"><b>Baseline confidence</b><span>${a.baseline?.confidence||0}%</span></div><div class="tiny">Kingdom can attenuate Falco-only risk for stable behavior when Trivy is clean. The event is still recorded and the rule is never auto-suppressed.</div></section><section><h3>TOP FALCO RULES</h3>${rules}</section><section><h3>RESPONSE</h3><div class="toolbar"><button class="btn-secondary" onclick="evidence(${id})">Capture Evidence</button>${n?`<button class="btn-primary" onclick="scanIncident(${id},'${esc(n)}')">Scan Now</button>`:''}${top&&n?(expected?`<span class="tag good">✓ EXPECTED${a.expected_rule?.expires_ts?' · expires '+new Date(a.expected_rule.expires_ts*1000).toLocaleString():' · permanent'}</span>`:`<button onclick="markIncidentExpected(${id},'${esc(top)}','${esc(n)}')">Mark Expected</button>`):''}${n?`<button class="danger" onclick="isolateIncident(${id})">Isolate</button>`:''}${allow?`<button class="danger" onclick="createRecovery('${esc(n)}',${id})">Approved Recovery</button>`:''}<button class="btn-success" onclick="resolveIncident(${id})">Resolve</button></div>${!allow&&n?`<div style="margin-top:8px"><b class="tiny">Recovery unavailable:</b>${recovery}</div>`:''}</section>`;document.getElementById('drawer').classList.remove('hidden')}catch(e){toast(e.message,'error')}}async function evidence(id){return guarded('evidence:'+id,'Capturing',async()=>{try{let d=await api(`/api/incidents/${id}/capture-evidence`,{method:'POST',timeout:780000});toast('Evidence captured: '+(d.captured||[]).join(', '));await load();await openIncident(id);return d}catch(e){toast(e.message,'error');throw e}})}async function resolveIncident(id){let r=await kmDialog({title:`Resolve incident #${id}`,text:'Add an operator resolution note. The incident remains available in history.',input:true,value:'Resolved by operator',ok:'Resolve'});if(r===null)return;return guarded('resolve:'+id,'Resolving',async()=>{try{await api(`/api/incidents/${id}/resolve`,{method:'POST',body:JSON.stringify({resolution:r})});toast(`Incident #${id} resolved`);closeDrawer();await load()}catch(e){toast(e.message,'error');throw e}})}async function sendReport(k){try{let d=await api(`/api/reports/send/${k}`,{method:'POST'});toast(`${k} report processed · Discord: ${d.delivery.discord} · n8n: ${d.delivery.n8n}`);load()}catch(e){toast(e.message,'error')}}async function openIncidentHistory(){let rows=await api('/api/incidents?status=all');document.getElementById('drawerTitle').textContent='Incident History';document.getElementById('drawerSubtitle').textContent='Open, investigating, resolved and dismissed Kingdom incidents';document.getElementById('drawerBody').innerHTML=`<section><input id="historySearch" placeholder="Search incidents" oninput="filterIncidentHistory()"></section><section id="incidentHistoryRows">${rows.map(i=>`<div class="event incident-history-row" data-search="${esc((i.container_name||'host')+' '+i.title+' '+i.severity+' '+i.status)}"><div><strong>#${i.id} ${esc(i.container_name||'host')} · ${esc(i.severity).toUpperCase()}</strong><span class="tiny">${esc(i.status)} · ${esc(i.title)}</span></div><button onclick="openIncident(${i.id})">Open</button></div>`).join('')||'<div class="tiny">No incident history.</div>'}</section>`;document.getElementById('drawer').classList.remove('hidden')}function filterIncidentHistory(){let q=document.getElementById('historySearch').value.toLowerCase();document.querySelectorAll('.incident-history-row').forEach(x=>x.classList.toggle('hidden',!x.dataset.search.toLowerCase().includes(q)))}async function openConfidence(){let [ins,ss]=await Promise.all([api('/api/integrations'),api('/api/security/score')]);let names=['falco','trivy','clamav','crowdsec'];document.getElementById('drawerTitle').textContent='Monitoring Confidence';document.getElementById('drawerSubtitle').textContent=`${ss.monitoring_confidence}% visibility across core Kingdom security sensors`;document.getElementById('drawerBody').innerHTML=`<section>${names.map(n=>`<div class="event"><div><strong>${n.toUpperCase()}</strong><span class="tiny">${ins[n]?.configured===false?'Not configured':'Configured'} · ${esc(ins[n]?.status||'unknown')}</span></div><span class="tag ${ins[n]?.status==='ok'?'good':'bad'}">${ins[n]?.status==='ok'?'CONTRIBUTING':'DEGRADED'}</span></div>`).join('')}</section>${(ss.unavailable_sensors||[]).length?`<section><b>Score confidence deductions</b><div class="tiny">Unavailable: ${esc(ss.unavailable_sensors.join(', '))}</div></section>`:'<section><div class="attention-ok">✓ All four core security sensors are contributing.</div></section>'}`;document.getElementById('drawer').classList.remove('hidden')}async function setActivityFilter(category,btn){ACTIVITY_FILTER=category;document.querySelectorAll('#activityFilters button').forEach(x=>x.classList.remove('active'));btn.classList.add('active');await loadActivity()}async function loadActivity(){let ev=await api(`/api/activity?limit=60&include_idle=false${ACTIVITY_FILTER?'&category='+encodeURIComponent(ACTIVITY_FILTER):''}`);document.getElementById('activity').innerHTML=ev.map(e=>`<div class="event"><div><strong>${esc(e.icon)} ${esc(e.subject||e.kind)}</strong><span class="tiny">${esc(e.summary)}</span></div><span class="tiny">${new Date(e.ts*1000).toLocaleTimeString()}</span></div>`).join('')||'<div class="tiny">No activity in this filter.</div>'}async function openBaselines(container=''){let rows=await api('/api/intelligence/baselines?days=7');if(container)rows=rows.filter(x=>x.container===container);document.getElementById('drawerTitle').textContent='Kingdom Baseline Learning';document.getElementById('drawerSubtitle').textContent='Suggestions only — Kingdom never auto-suppresses learned behavior';document.getElementById('drawerBody').innerHTML=`<section>${rows.map(x=>`<div class="baseline-item"><div><div class="baseline-title">${esc(x.container)} · ${esc(x.rule)}</div><div class="baseline-meta">${x.count} events · ${x.days_seen} day(s) observed · ${x.span_hours}h span · baseline ${esc(x.status||'unknown')} · confidence ${x.confidence??x.baseline_confidence}% · effective adjustment ${x.effective_score_adjustment||0}</div><div class="baseline-actions">${x.approved?`<span class="status-chip good">✓ APPROVED${x.suppression?.expires_ts?' · expires '+new Date(x.suppression.expires_ts*1000).toLocaleString():' · permanent'}</span>`:`<button class="btn-primary btn-compact" onclick="suppressFalco('${esc(x.container)}','${esc(x.rule)}')">Review</button><button class="btn-secondary btn-compact" onclick="suppressFalco('${esc(x.container)}','${esc(x.rule)}')">Mark Expected</button>`}</div></div><div class="baseline-side"><span class="status-chip ${x.approved||x.suggested?'good':'warn'}">${x.approved?'EXPECTED':x.suggested?'SUGGESTED':'OBSERVE'}</span></div></div>`).join('')||'<div class="tiny">No recurring behavior has enough history for a baseline suggestion yet.</div>'}</section>`;document.getElementById('drawer').classList.remove('hidden')}
 async function recommendationAction(r){if(r.action==='scan'&&r.container){await scan(r.container);return}if(r.action==='incident'&&r.incident_id){await openIncident(r.incident_id);return}if(r.action==='review-falco'&&r.container){await openBaselines(r.container);return}if(r.action==='diagnose'){await openConfidence();return}if(r.container){await openDrawer(r.container);return}toast('Container security profile is unavailable for this recommendation.','warn')}
 function closeDrawer(){document.getElementById('drawer').classList.add('hidden')}async function suppressFalco(n,rule){let p=await api('/api/suppressions/preview',{method:'POST',body:JSON.stringify({source:'falco',container_name:n,rule_contains:rule})});let go=await kmDialog({title:'Known-good suppression preview',text:`${p.scope}\n${p.matching_events_24h} matching events in 24h.\nGlobal suppression is blocked.`,ok:'Continue'});if(!go)return;let expiry=await kmDialog({title:'Duration',text:'Hours: 24=1 day, 168=7 days, 0=permanent',input:true,value:'168',ok:'Continue'});if(expiry===null)return;let reason=await kmDialog({title:'Reason',text:p.scope,input:true,value:'Known-good behavior for this container',ok:'Save suppression'});if(!reason)return;await api('/api/suppressions',{method:'POST',body:JSON.stringify({source:'falco',container_name:n,rule_contains:rule,reason,expires_hours:Number(expiry)||0})});toast('Scoped suppression added for '+rule);openDrawer(n)}async function maintenance(n,on){await api(`/api/maintenance/${encodeURIComponent(n)}`,{method:'PUT',body:JSON.stringify({enabled:on,minutes:60,reason:'Operator maintenance'})});openDrawer(n);load()}
-async function openDrawer(n){let d=await api(`/api/containers/${encodeURIComponent(n)}/security-profile`);document.getElementById('drawerTitle').textContent=n;document.getElementById('drawerSubtitle').textContent=(d.image||'')+' · '+(d.risk?.state||'unknown');let p=d.policy||{},r=d.risk||{},sc=d.last_successful_scan,attempt=d.latest_scan_attempt,m=d.maintenance||{},activeIncident=(d.incidents||[]).find(x=>!['resolved','dismissed'].includes(x.status));let remediation=[];if(attempt&&attempt.status!=='ok')remediation.push({sev:'medium',title:'Trivy verification failed',detail:attempt.error||'Latest vulnerability scan failed.',action:`<button class="btn-primary" onclick="scan('${esc(n)}')">Retry Scan</button>`});else if(!sc)remediation.push({sev:'medium',title:'No successful vulnerability scan',detail:'Run Trivy before trusting vulnerability status.',action:`<button class="btn-primary" onclick="scan('${esc(n)}')">Scan Now</button>`});else if((sc.critical||0)>0||(sc.high||0)>0){if(p.local_build)remediation.push({sev:(sc.critical||0)>0?'critical':'high',title:`${sc.critical||0} critical · ${sc.high||0} high vulnerabilities`,detail:'Local build: update the Dockerfile base image and/or project dependencies, rebuild from source, then rescan. Rebuilding unchanged source may reproduce the same vulnerabilities.',action:`<button class="btn-local" onclick="showLocalBuildHelp('${esc(n)}')">Local Fix Path</button>`});else remediation.push({sev:(sc.critical||0)>0?'critical':'high',title:`${sc.critical||0} critical · ${sc.high||0} high vulnerabilities`,detail:'Compare the running image against the newest candidate, list every known issue, and apply the safest fixes Kingdom can with rollback protection.',action:`<button class="btn-primary" onclick="fixWhatKingdomCan('${esc(n)}')">🛠 Fix What Kingdom Can</button>`});}if(activeIncident)remediation.push({sev:activeIncident.severity||'medium',title:`Active ${activeIncident.severity||'security'} incident`,detail:'Open the incident for evidence, corroboration, and response playbook.',action:`<button class="btn-secondary" onclick="openIncident(${activeIncident.id})">Investigate</button>`});if((r.score??100)<75&&!activeIncident)remediation.push({sev:'medium',title:'Elevated container risk',detail:(r.factors||[]).slice(0,2).join(' · ')||'Kingdom risk analysis requires review.',action:`<button class="btn-secondary" onclick="scan('${esc(n)}')">Refresh Verification</button>`});let remediationHtml=remediation.length?remediation.map(x=>`<div class="remediation-item"><div><span class="tag ${x.sev==='critical'||x.sev==='high'?'bad':'warn'}">${esc(x.sev)}</span><strong>${esc(x.title)}</strong><div class="tiny">${esc(x.detail)}</div></div><div class="remediation-action">${x.action}</div></div>`).join(''):`<div class="remediation-clear">✓ No immediate remediation recommended. Continue monitoring.</div>`;let sec=(d.recent_security_events||[]).slice(0,8).map(e=>`<div class="event"><div><strong class="${e.severity==='critical'?'bad':e.severity==='high'?'warn':''}">${esc(e.source)} · ${esc(e.severity)}</strong><span class="tiny">${esc(e.rule||e.message).slice(0,130)}</span>${e.source==='falco'&&e.rule?(e.expected?`<div class="event-actions"><span class="tag good">✓ EXPECTED${e.suppression?.expires_ts?' · '+age(Math.max(0,e.suppression.expires_ts-Math.floor(Date.now()/1000)))+' remaining':' · permanent'}</span></div>`:`<div class="event-actions"><button onclick="suppressFalco('${esc(n)}','${esc(e.rule)}')">Mark Expected</button></div>`):''}</div><span class="tiny">${new Date(e.ts*1000).toLocaleTimeString()}</span></div>`).join('')||'<div class="tiny">No recent security events.</div>';document.getElementById('drawerBody').innerHTML=`<section><div class="kv"><b>Security score</b><span>${r.score??100}/100 · ${esc(r.state||'healthy')}</span></div><div class="kv"><b>Profile</b><span>${esc(d.risk_profile?.profile)} ×${d.risk_profile?.weight}</span></div><div class="kv"><b>Networks</b><span>${esc((d.networks||[]).join(', '))}</span></div><div class="kv"><b>Top factors</b><span>${esc((r.factors||[]).join(' · '))}</span></div></section><section class="remediation-panel"><div class="remediation-head"><div><h3>🛠 REMEDIATION</h3><div class="tiny">Kingdom recommends the safest next action from current container evidence. Destructive recovery remains approval-gated.</div></div><span class="tag ${remediation.length?'warn':'good'}">${remediation.length?remediation.length+' ACTION'+(remediation.length===1?'':'S'):'CLEAR'}</span></div>${remediationHtml}</section><section><h3>Recovery & Response Policy</h3><div class="policybar">${policyButton(n,'Approved Rebuild','allow_rebuild',!!p.allow_rebuild)}${policyButton(n,'Auto-Isolate','auto_isolate',!!p.auto_isolate)}${policyButton(n,'Auto-Restart','auto_restart',!!p.auto_restart)}${policyButton(n,'Auto-Update','auto_update',!!p.auto_update)}${policyButton(n,'Local Build','local_build',!!p.local_build,'localbuild')}${policyButton(n,'Protected','protected',!!p.protected,'protected')}</div><div class="toolbar" style="margin-top:10px"><button onclick="scan('${esc(n)}')">Scan Now</button><button onclick="act('${esc(n)}','restart')">Restart</button><button class="danger" onclick="act('${esc(n)}','isolate')">Isolate</button><button onclick="maintenance('${esc(n)}',${m.enabled?'false':'true'})">${m.enabled?'End Maintenance':'Maintenance 1h'}</button>${p.allow_rebuild&&!p.protected?`<button class="danger" onclick="createRecovery('${esc(n)}',${(d.incidents||[]).find(x=>!['resolved','dismissed'].includes(x.status))?.id||'null'})">Recovery Plan</button>`:''}</div></section><section><h3>Trivy Verification</h3>${attempt&&attempt.status!=='ok'?`<div class="kv"><b>Latest attempt</b><span class="bad">SCAN ERROR · ${age(Math.max(0,Math.floor(Date.now()/1000)-attempt.ts))}</span></div><div class="tiny bad">${esc(attempt.error||'Trivy scan failed').slice(0,220)}</div>`:(attempt?`<div class="kv"><b>Latest attempt</b><span class="good">OK · ${age(Math.max(0,Math.floor(Date.now()/1000)-attempt.ts))}</span></div>`:'')} ${sc?`<div class="kv"><b>Last successful scan</b><span>${sc.critical} critical · ${sc.high} high · ${sc.medium} medium · ${age(Math.max(0,Math.floor(Date.now()/1000)-sc.ts))}</span></div><div class="toolbar" style="margin-top:10px"><button onclick="showVulnerabilities('${esc(n)}')">View All Issues</button><button class="btn-primary" onclick="fixWhatKingdomCan('${esc(n)}')">🛠 Fix What Kingdom Can</button></div>`:'<div class="tiny">No successful scan yet.</div>'}</section><section><h3>Recent Security Evidence</h3>${sec}</section><section><h3>Mounts</h3><div class="tiny">${esc((d.mounts||[]).map(x=>`${x.destination} (${x.type}${x.rw?', rw':', ro'})`).join(' · ')||'None')}</div></section>`;document.getElementById('drawer').classList.remove('hidden')}
+async function openDrawer(n){let d=await api(`/api/containers/${encodeURIComponent(n)}/security-profile`);document.getElementById('drawerTitle').textContent=n;document.getElementById('drawerSubtitle').textContent=(d.image||'')+' · '+(d.risk?.state||'unknown');let p=d.policy||{},r=d.risk||{},sc=d.last_successful_scan,attempt=d.latest_scan_attempt,m=d.maintenance||{},activeIncident=(d.incidents||[]).find(x=>!['resolved','dismissed'].includes(x.status));let remediation=[];if(attempt&&attempt.status!=='ok')remediation.push({sev:'medium',title:'Trivy verification failed',detail:attempt.error||'Latest vulnerability scan failed.',action:`<button class="btn-primary" onclick="scan('${esc(n)}')">Retry Scan</button>`});else if(!sc)remediation.push({sev:'medium',title:'No successful vulnerability scan',detail:'Run Trivy before trusting vulnerability status.',action:`<button class="btn-primary" onclick="scan('${esc(n)}')">Scan Now</button>`});else if((sc.critical||0)>0||(sc.high||0)>0){if(p.local_build)remediation.push({sev:(sc.critical||0)>0?'critical':'high',title:`${sc.critical||0} critical · ${sc.high||0} high vulnerabilities`,detail:'Local build: update the Dockerfile base image and/or project dependencies, rebuild from source, then rescan. Rebuilding unchanged source may reproduce the same vulnerabilities.',action:`<button class="btn-local" onclick="showLocalBuildHelp('${esc(n)}')">Local Fix Path</button>`});else remediation.push({sev:(sc.critical||0)>0?'critical':'high',title:`${sc.critical||0} critical · ${sc.high||0} high vulnerabilities`,detail:'Compare the running image against the newest candidate, list every known issue, and apply the safest fixes Kingdom can with rollback protection.',action:`<button class="btn-primary" onclick="fixWhatKingdomCan('${esc(n)}')">🛠 Fix What Kingdom Can</button>`});}if(activeIncident)remediation.push({sev:activeIncident.severity||'medium',title:`Active ${activeIncident.severity||'security'} incident`,detail:'Open the incident for evidence, corroboration, and response playbook.',action:`<button class="btn-secondary" onclick="openIncident(${activeIncident.id})">Investigate</button>`});if((r.score??100)<75&&!activeIncident)remediation.push({sev:'medium',title:'Elevated container risk',detail:(r.factors||[]).slice(0,2).join(' · ')||'Kingdom risk analysis requires review.',action:`<button class="btn-secondary" onclick="scan('${esc(n)}')">Refresh Verification</button>`});let remediationHtml=remediation.length?remediation.map(x=>`<div class="remediation-item"><div><span class="tag ${x.sev==='critical'||x.sev==='high'?'bad':'warn'}">${esc(x.sev)}</span><strong>${esc(x.title)}</strong><div class="tiny">${esc(x.detail)}</div></div><div class="remediation-action">${x.action}</div></div>`).join(''):`<div class="remediation-clear">✓ No immediate remediation recommended. Continue monitoring.</div>`;let sec=(d.recent_security_events||[]).slice(0,8).map(e=>`<div class="event"><div><strong class="${e.severity==='critical'?'bad':e.severity==='high'?'warn':''}">${esc(e.source)} · ${esc(e.severity)}</strong><span class="tiny">${esc(e.rule||e.message).slice(0,130)}</span>${e.source==='falco'&&e.rule?(e.expected?`<div class="event-actions"><span class="tag good">✓ EXPECTED${e.suppression?.expires_ts?' · '+age(Math.max(0,e.suppression.expires_ts-Math.floor(Date.now()/1000)))+' remaining':' · permanent'}</span></div>`:`<div class="event-actions"><button onclick="suppressFalco('${esc(n)}','${esc(e.rule)}')">Mark Expected</button></div>`):''}</div><span class="tiny">${new Date(e.ts*1000).toLocaleTimeString()}</span></div>`).join('')||'<div class="tiny">No recent security events.</div>';document.getElementById('drawerBody').innerHTML=`<section><div class="kv"><b>Security score</b><span>${r.score??100}/100 · ${esc(r.state||'healthy')}</span></div><div class="kv"><b>Profile</b><span>${esc(d.risk_profile?.profile)} ×${d.risk_profile?.weight}</span></div><div class="kv"><b>Networks</b><span>${esc((d.networks||[]).join(', '))}</span></div><div class="kv"><b>Top factors</b><span>${esc((r.factors||[]).join(' · '))}</span></div></section><section class="remediation-panel"><div class="remediation-head"><div><h3>🛠 REMEDIATION</h3><div class="tiny">Kingdom recommends the safest next action from current container evidence. Destructive recovery remains approval-gated.</div></div><span class="tag ${remediation.length?'warn':'good'}">${remediation.length?remediation.length+' ACTION'+(remediation.length===1?'':'S'):'CLEAR'}</span></div>${remediationHtml}</section><section><h3>Recovery & Response Policy</h3><div class="policybar">${policyButton(n,'Approved Rebuild','allow_rebuild',!!p.allow_rebuild)}${policyButton(n,'Auto-Isolate','auto_isolate',!!p.auto_isolate)}${policyButton(n,'Auto-Restart','auto_restart',!!p.auto_restart)}${policyButton(n,'Auto-Update','auto_update',!!p.auto_update)}${policyButton(n,'Local Build','local_build',!!p.local_build,'localbuild')}${policyButton(n,'Allow Stateful Update','allow_stateful_update',!!p.allow_stateful_update,'stateful')}${policyButton(n,'Protected','protected',!!p.protected,'protected')}</div><div class="toolbar" style="margin-top:10px"><button onclick="scan('${esc(n)}')">Scan Now</button><button onclick="act('${esc(n)}','restart')">Restart</button><button class="danger" onclick="act('${esc(n)}','isolate')">Isolate</button><button onclick="maintenance('${esc(n)}',${m.enabled?'false':'true'})">${m.enabled?'End Maintenance':'Maintenance 1h'}</button>${p.allow_rebuild&&!p.protected?`<button class="danger" onclick="createRecovery('${esc(n)}',${(d.incidents||[]).find(x=>!['resolved','dismissed'].includes(x.status))?.id||'null'})">Recovery Plan</button>`:''}</div></section><section><h3>Trivy Verification</h3>${attempt&&attempt.status!=='ok'?`<div class="kv"><b>Latest attempt</b><span class="bad">SCAN ERROR · ${age(Math.max(0,Math.floor(Date.now()/1000)-attempt.ts))}</span></div><div class="tiny bad">${esc(attempt.error||'Trivy scan failed').slice(0,220)}</div>`:(attempt?`<div class="kv"><b>Latest attempt</b><span class="good">OK · ${age(Math.max(0,Math.floor(Date.now()/1000)-attempt.ts))}</span></div>`:'')} ${sc?`<div class="kv"><b>Last successful scan</b><span>${sc.critical} critical · ${sc.high} high · ${sc.medium} medium · ${age(Math.max(0,Math.floor(Date.now()/1000)-sc.ts))}</span></div><div class="toolbar" style="margin-top:10px"><button onclick="showVulnerabilities('${esc(n)}')">View All Issues</button><button class="btn-primary" onclick="fixWhatKingdomCan('${esc(n)}')">🛠 Fix What Kingdom Can</button></div>`:'<div class="tiny">No successful scan yet.</div>'}</section><section><h3>Recent Security Evidence</h3>${sec}</section><section><h3>Mounts</h3><div class="tiny">${esc((d.mounts||[]).map(x=>`${x.destination} (${x.type}${x.rw?', rw':', ro'})`).join(' · ')||'None')}</div></section>`;document.getElementById('drawer').classList.remove('hidden')}
 async function openTrustDiagnostics(){try{let d=await api('/api/suppressions/diagnostics');document.getElementById('drawerTitle').textContent='Trust Pipeline Diagnostics';document.getElementById('drawerSubtitle').textContent=`${d.active} active approval(s) · ${d.matching_events_24h} matched event(s) in 24h · ${d.points_removed} max points removed`;document.getElementById('drawerBody').innerHTML=`<section><div class="tiny">Every approval below is exact container + source + rule scope. This view shows whether the approval actually reaches stored evidence and correlation scoring.</div></section><section>${(d.rows||[]).map(x=>`<div class="event"><div><strong>${esc(x.container_name||'host')} · ${esc(x.rule_contains||x.source)}</strong><span class="tiny">${x.active?'ACTIVE':'INACTIVE'} · ${x.matching_events_24h} matching events · ${x.matching_correlations_24h} matching evaluations · ${x.live_original_risk??0} raw → ${x.live_effective_risk??0} effective · ${x.points_removed} points removed${x.expires_ts?' · expires '+new Date(x.expires_ts*1000).toLocaleString():' · permanent'}</span>${x.sample_match?`<div class="tiny good">Matched: ${esc(x.sample_match).slice(0,180)}</div>`:''}${x.blocker?`<div class="tiny warn">Why not applied: ${esc(x.blocker)}</div>`:''}</div><span class="tag ${x.active&&x.matching_correlations_24h?'good':'warn'}">${x.active&&x.matching_correlations_24h?'APPLIED':x.active?'CHECK':'EXPIRED'}</span></div>`).join('')||'<div class="tiny">No suppression approvals exist.</div>'}</section>`;document.getElementById('drawer').classList.remove('hidden')}catch(e){toast(e.message,'error')}}
 
 function drawHistory(rows){let svg=document.getElementById('historyChart');if(!rows.length){svg.innerHTML='<text x="10" y="55" fill="#8fa3b5">History begins after this upgrade.</text>';document.getElementById('historyMeta').textContent='';return}let w=500,h=110,min=Math.min(...rows.map(x=>x.score)),max=Math.max(...rows.map(x=>x.score));let pts=rows.map((x,i)=>`${(i/(Math.max(1,rows.length-1))*w).toFixed(1)},${(h-10-(x.score/100)*(h-20)).toFixed(1)}`).join(' ');svg.innerHTML=`<polyline fill="none" stroke="#32b7ff" stroke-width="3" points="${pts}"/><line x1="0" y1="${h-10-0.75*(h-20)}" x2="500" y2="${h-10-0.75*(h-20)}" stroke="#294153" stroke-dasharray="4 4"/>`;document.getElementById('historyMeta').textContent=`${rows[0].score} → ${rows[rows.length-1].score} · range ${min}–${max}`}
+
+function sevPill(label,value,kind=''){
+  return `<div class="remed-sev ${kind}"><span>${esc(label)}</span><b>${Number(value||0)}</b></div>`
+}
+function remediationComparisonHtml(n,c,g={}){
+  let cur=c.current||{},cand=c.candidate||{};
+  let risk=Number(c.risk_reduction_percent||0);
+  let backupAge=g.backup_age_seconds!=null?age(Math.max(0,Number(g.backup_age_seconds))):'not verified';
+  return `<div class="remed-shell">
+    <div class="remed-hero">
+      <div>
+        <div class="eyebrow">KINGDOM REMEDIATION</div>
+        <h3>${esc(n)}</h3>
+        <div class="tiny">Current image compared against the newest verified candidate.</div>
+      </div>
+      <div class="risk-badge ${risk>0?'good':'warn'}">
+        <span>Risk reduction</span>
+        <b>${risk}%</b>
+      </div>
+    </div>
+
+    <div class="remed-compare">
+      <div class="remed-card">
+        <div class="remed-card-title">CURRENT</div>
+        <div class="remed-severity-grid">
+          ${sevPill('Critical',cur.critical,'critical')}
+          ${sevPill('High',cur.high,'high')}
+          ${sevPill('Medium',cur.medium,'medium')}
+        </div>
+      </div>
+      <div class="remed-arrow">→</div>
+      <div class="remed-card candidate">
+        <div class="remed-card-title">CANDIDATE</div>
+        <div class="remed-severity-grid">
+          ${sevPill('Critical',cand.critical,'critical')}
+          ${sevPill('High',cand.high,'high')}
+          ${sevPill('Medium',cand.medium,'medium')}
+        </div>
+      </div>
+    </div>
+
+    <div class="remed-impact-grid">
+      <div class="impact-card good"><span>Removed</span><b>${Number(c.removed_count??c.fixable_now_count??0)}</b></div>
+      <div class="impact-card"><span>Still present</span><b>${Number(c.remaining_count||0)}</b></div>
+      <div class="impact-card ${Number(c.introduced_count||0)>0?'bad':'good'}"><span>New</span><b>${Number(c.introduced_count||0)}</b></div>
+    </div>
+
+    ${g.has_mounts?`<div class="data-safety-card">
+      <div class="data-safety-head"><span>🛡 DATA SAFETY</span><span class="tag ${g.effective_stateful_update_allowed&&(!g.backup_required||g.backup_fresh)?'good':'warn'}">${g.effective_stateful_update_allowed&&(!g.backup_required||g.backup_fresh)?'READY':'ACTION NEEDED'}</span></div>
+      <div class="safety-row"><span>${g.has_mounts?'✓':'○'}</span><div><b>Persistent data detected</b><div class="tiny">Kingdom will not assume image rollback can reverse database migrations.</div></div></div>
+      <div class="safety-row"><span>${g.effective_stateful_update_allowed?'✓':'○'}</span><div><b>Allow Stateful Update</b><div class="tiny">${g.effective_stateful_update_allowed?'Enabled for this container':'Disabled for this container'}</div></div></div>
+      <div class="safety-row"><span>${g.backup_fresh?'✓':'○'}</span><div><b>Verified backup</b><div class="tiny">${g.backup_fresh?`${esc(g.backup_provider||'configured provider')} · ${backupAge} ago`:'No sufficiently recent verified backup'}</div></div></div>
+      <div class="safety-row"><span>✓</span><div><b>Portainer / Compose rollback</b><div class="tiny">The deployment definition remains the source of truth.</div></div></div>
+    </div>`:''}
+  </div>`
+}
+
 async function showVulnerabilities(n){try{
   let d=await api(`/api/containers/${encodeURIComponent(n)}/vulnerabilities`),f=d.findings||[];
   document.getElementById('drawerTitle').textContent=`Vulnerabilities · ${n}`;
   document.getElementById('drawerSubtitle').textContent=`${d.fixable_count||0} with listed fixes · ${d.unfixed_count||0} waiting on upstream`;
-  document.getElementById('drawerBody').innerHTML=`<section><div class="toolbar"><button onclick="openDrawer('${esc(n)}')">← Security Profile</button><button class="btn-primary" onclick="fixWhatKingdomCan('${esc(n)}')">🛠 Fix What Kingdom Can</button></div></section><section>${f.length?f.map(x=>`<div class="vuln-row"><div><span class="tag ${x.severity==='critical'?'bad':x.severity==='high'?'warn':''}">${esc(x.severity)}</span> <strong>${esc(x.vuln_id||'Finding')}</strong> · ${esc(x.pkg_name||'package')} ${esc(x.installed_version||'')}<div class="tiny">${esc(x.title||'')}</div><div class="tiny ${x.fix_available?'good':'warn'}">${esc(x.remediation)}</div></div></div>`).join(''):'<div class="tiny">No stored vulnerability findings.</div>'}</section>`;
+  document.getElementById('drawerBody').innerHTML=`<section class="vuln-toolbar"><div class="toolbar"><button onclick="openDrawer('${esc(n)}')">← Security Profile</button><button class="btn-primary" onclick="fixWhatKingdomCan('${esc(n)}')">🛠 Fix What Kingdom Can</button></div><div class="vuln-kpis"><div><span>Fix available</span><b>${d.fixable_count||0}</b></div><div><span>Waiting upstream</span><b>${d.unfixed_count||0}</b></div><div><span>Total</span><b>${f.length}</b></div></div></section><section class="vuln-list">${f.length?f.map(x=>`<div class="vuln-row"><div class="vuln-row-head"><span class="tag ${x.severity==='critical'?'bad':x.severity==='high'?'warn':''}">${esc(x.severity)}</span><strong>${esc(x.vuln_id||'Finding')}</strong><span class="vuln-package">${esc(x.pkg_name||'package')} · ${esc(x.installed_version||'unknown')}</span></div><div class="vuln-title">${esc(x.title||'')}</div><div class="vuln-fix ${x.fix_available?'good':'warn'}">${x.fix_available?'✓ ':'○ '}${esc(x.remediation)}</div></div>`).join(''):'<div class="tiny">No stored vulnerability findings.</div>'}</section>`;
   document.getElementById('drawer').classList.remove('hidden')
 }catch(e){toast(e.message,'error')}}
 
@@ -3451,44 +3603,28 @@ async function fixWhatKingdomCan(n){return guarded('remediate:'+n,'Planning fixe
     await showVulnerabilities(n);return
   }
   let c=r.verification?.comparison||{},cur=c.current||{},cand=c.candidate||{},g=r.stateful_gate||{};
-  let summary=`CURRENT: ${cur.critical||0} critical · ${cur.high||0} high · ${cur.medium||0} medium
-CANDIDATE: ${cand.critical||0} critical · ${cand.high||0} high · ${cand.medium||0} medium
-
-Removed by candidate: ${c.fixable_now_count||0}
-Still present: ${c.remaining_count||0}
-Newly introduced: ${c.introduced_count||0}
-Overall risk change: ${c.risk_reduction_percent??0}%`;
-  if(g.has_mounts&&!g.global_stateful_updates_enabled){
-    await kmDialog({title:`Stateful update safety gate · ${n}`,text:summary+`
-
-Kingdom found mounted application data. Registry remediation is ready, but KM_UPDATE_ALLOW_STATEFUL is currently disabled because image rollback cannot undo a database/data migration. Enable stateful updates only after validating a data backup.`,ok:'Close'});return
+  let panel=remediationComparisonHtml(n,c,g);
+  if(g.has_mounts&&!g.effective_stateful_update_allowed){
+    await kmDialog({title:`Stateful update safety gate · ${n}`,html:panel+`<div class="remed-callout warn"><b>Stateful permission required</b><div>Enable <b>Allow Stateful Update</b> for this container only after you trust its application-data backup.</div></div>`,ok:'Close',wide:true});return
   }
   if(g.backup_required&&!g.backup_fresh){
-    await kmDialog({title:`Verified backup required · ${n}`,text:summary+`
-
-This container requires a verified backup newer than the configured backup age before Kingdom will modify it. Mark/verify the backup in Disaster Recovery, then run Fix What Kingdom Can again.`,ok:'Open Disaster Recovery'});
+    await kmDialog({title:`Verified backup required · ${n}`,html:panel+`<div class="remed-callout warn"><b>Backup required</b><div>Verify a recent application-data backup in Disaster Recovery, then run remediation again.</div></div>`,ok:'Open Disaster Recovery',wide:true});
     await openRecoveryCenter();return
   }
   if(r.can_apply_now){
-    let ok=await kmDialog({title:`Fix what Kingdom can · ${n}`,text:summary+`
-
-This candidate passes the normal security gate. Kingdom will preserve rollback, redeploy through Portainer when available, and verify health.`,ok:'Apply Safe Fixes',danger:true});
+    let ok=await kmDialog({title:`Fix what Kingdom can · ${n}`,html:panel+`<div class="remed-callout good"><b>Safe remediation ready</b><div>The candidate passes normal security gates. Kingdom will preserve rollback, redeploy through Portainer when available, and verify health before declaring success.</div></div>`,ok:'Apply Safe Fixes',danger:true,wide:true});
     if(!ok)return;
     let a=await api(`/api/updates/${r.plan_id}/apply`,{method:'POST',timeout:300000});
     toast(a.ok?`Remediation applied to ${n}`:'Remediation failed','ok');await load();return
   }
   if(r.can_apply_safer_candidate){
-    let ok=await kmDialog({title:`Safer candidate · ${n}`,text:summary+`
-
-The candidate still has vulnerabilities, but it is measurably safer than what is running. Because Critical/High findings remain, Kingdom requires your explicit approval.`,ok:'Apply Safer Candidate',danger:true});
+    let ok=await kmDialog({title:`Safer candidate · ${n}`,html:panel+`<div class="remed-callout warn"><b>Risk-reducing update</b><div>The candidate is safer but not clean. Critical/High findings remain, so Kingdom requires explicit operator approval.</div></div>`,ok:'Apply Safer Candidate',danger:true,wide:true});
     if(!ok)return;
     await api(`/api/updates/${r.plan_id}/approve-risk-reduction`,{method:'POST'});
     let a=await api(`/api/updates/${r.plan_id}/apply`,{method:'POST',timeout:300000});
     toast(a.ok?`Risk-reducing fixes applied to ${n}`:'Update failed','ok');await load();return
   }
-  await kmDialog({title:`No safer automatic fix · ${n}`,text:summary+`
-
-The candidate is not safer enough to replace the running image under Kingdom policy.`,ok:'View Issues'});
+  await kmDialog({title:`No safer automatic fix · ${n}`,html:panel+`<div class="remed-callout bad"><b>No safe automatic improvement</b><div>The candidate is not safer enough to replace the running image under Kingdom policy.</div></div>`,ok:'View Issues',wide:true});
   await showVulnerabilities(n)
 }catch(e){toast(e.message,'error');throw e}})}
 
@@ -3530,6 +3666,7 @@ async function load(){let [ins,fs,ts,ss,incs]=await Promise.all([api('/api/integ
     ${policyButton(c.name,'Auto-Restart','auto_restart',!!p.auto_restart)}
     ${policyButton(c.name,'Auto-Update','auto_update',!!p.auto_update)}
     ${policyButton(c.name,'Local Build','local_build',!!p.local_build,'localbuild')}
+    ${policyButton(c.name,'Allow Stateful Update','allow_stateful_update',!!p.allow_stateful_update,'stateful')}
     ${policyButton(c.name,'Protected','protected',!!p.protected,'protected')}
   </div>
 </div>
