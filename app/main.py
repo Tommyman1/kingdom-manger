@@ -17,7 +17,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-VERSION = "3.2.9"
+VERSION = "3.2.10"
 app = FastAPI(title="Kingdom Manager", version=VERSION)
 
 DOCKER = os.getenv("DOCKER_HOST", "tcp://docker-socket-proxy:2375").replace("tcp://", "http://")
@@ -112,6 +112,7 @@ DRIFT_SCAN_SECONDS = int(os.getenv("KM_DRIFT_SCAN_SECONDS", "1800"))
 BACKUP_MAX_AGE_HOURS = int(os.getenv("KM_BACKUP_MAX_AGE_HOURS", "48"))
 PREUPDATE_BACKUP_ENABLED = os.getenv("KM_PREUPDATE_BACKUP_ENABLED", "true").lower() in {"1","true","yes","on"}
 PREUPDATE_BACKUP_RETENTION = int(os.getenv("KM_PREUPDATE_BACKUP_RETENTION", "5"))
+SELF_CONTAINER_NAME = os.getenv("KM_SELF_CONTAINER", "kingdom-manager")
 AUTO_SAFE_PLAYBOOKS = os.getenv("KM_AUTO_SAFE_PLAYBOOKS", "true").lower() in {"1","true","yes","on"}
 SCHEMA_VERSION = 18
 
@@ -3018,64 +3019,180 @@ async def container_vulnerabilities(name: str, authorization: str|None=Header(de
 
 
 async def create_preupdate_backup(container_name: str) -> dict:
+    """Create a verified crash-consistent archive of persistent mounts.
+
+    This is a filesystem-level pre-update snapshot, not an application-native
+    database dump. Stateful services that need transactional/database-native
+    backups should still use those backups for full disaster recovery.
+    """
     if not PREUPDATE_BACKUP_ENABLED:
         return {"ok":False,"verified":False,"reason":"automatic pre-update backups disabled"}
+
     obj=await inspect_container(container_name)
-    mounts=[m for m in (obj.get("Mounts") or []) if m.get("Type") in {"bind","volume"} and m.get("Source")]
+    mounts=[m for m in (obj.get("Mounts") or [])
+            if m.get("Type") in {"bind","volume"} and m.get("Source") and m.get("Destination")]
     if not mounts:
         return {"ok":True,"verified":True,"provider":"none-required","reason":"no persistent mounts"}
+
+    # Resolve the host-side source backing Kingdom Manager's persistent /data.
+    # Docker bind sources are interpreted by the daemon/host, not by this container.
+    self_obj=await inspect_container(SELF_CONTAINER_NAME)
+    self_data=next((m for m in (self_obj.get("Mounts") or [])
+                    if m.get("Destination")=="/data" and m.get("Source")),None)
+    if not self_data:
+        return {"ok":False,"verified":False,
+                "reason":"Kingdom Manager /data persistent mount could not be resolved"}
+
     safe=re.sub(r"[^A-Za-z0-9_.-]+","_",container_name)
-    backup_root=DATA_DIR/"preupdate-backups"/safe; backup_root.mkdir(parents=True,exist_ok=True)
-    stamp=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"); archive=f"{safe}-{stamp}.tar.gz"
+    backup_root=DATA_DIR/"preupdate-backups"/safe
+    backup_root.mkdir(parents=True,exist_ok=True)
+    stamp=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    archive=f"{safe}-{stamp}.tar.gz"
+
     binds=[]; paths=[]; manifest_mounts=[]
     for i,m in enumerate(mounts):
-        hp=f"/km-src/{i}"; binds.append(f"{m['Source']}:{hp}:ro"); paths.append(hp)
-        manifest_mounts.append({"type":m.get("Type"),"source":m.get("Source"),"destination":m.get("Destination")})
-    binds.append(f"{backup_root}:/km-backup:rw")
-    payload={"Image":"alpine:3.22","Cmd":["sh","-c","set -eu; tar -czf /km-backup/"+archive+" "+" ".join(paths)+"; test -s /km-backup/"+archive],
-             "HostConfig":{"Binds":binds},"Labels":{"kingdom.manager.role":"preupdate-backup","kingdom.manager.container":container_name}}
+        hp=f"/km-src/{i}"
+        binds.append(f"{m['Source']}:{hp}:ro")
+        paths.append(hp)
+        manifest_mounts.append({
+            "type":m.get("Type"),
+            "source":m.get("Source"),
+            "destination":m.get("Destination"),
+            "read_only_in_backup_helper":True,
+        })
+
+    # Mount the host source backing Kingdom Manager /data, then write into the
+    # corresponding subdirectory. This survives Kingdom Manager recreation.
+    binds.append(f"{self_data['Source']}:/km-data:rw")
+    rel_backup=f"preupdate-backups/{safe}"
+    shell_paths=" ".join(paths)
+    command=(
+        "set -eu; "
+        f"mkdir -p /km-data/{rel_backup}; "
+        f"tar -czf /km-data/{rel_backup}/{archive} {shell_paths}; "
+        f"test -s /km-data/{rel_backup}/{archive}"
+    )
+
+    payload={
+        "Image":"alpine:3.22",
+        "Cmd":["sh","-c",command],
+        "HostConfig":{"Binds":binds},
+        "Labels":{
+            "kingdom.manager.role":"preupdate-backup",
+            "kingdom.manager.container":container_name
+        }
+    }
+
     helper_id=None
     try:
         try:
-            created=await docker_json("POST","/containers/create",payload)
+            # Docker create expects a JSON request body and returns HTTP 201.
+            created=await docker_json(
+                "POST","/containers/create",
+                ok=(201,),
+                json=payload,
+            )
         except Exception as e:
             msg=str(e)
             if "No such image" in msg or "not found" in msg.lower():
-                raise RuntimeError("backup helper image alpine:3.22 is not present locally; pull alpine:3.22 once on the host, then retry") from e
+                raise RuntimeError(
+                    "backup helper image alpine:3.22 is not present locally; "
+                    "pull alpine:3.22 once on the host, then retry"
+                ) from e
             raise
-        helper_id=created.get("Id")
-        if not helper_id: raise RuntimeError("backup helper creation returned no container id")
-        await docker_json("POST",f"/containers/{helper_id}/start")
-        deadline=time.monotonic()+900; exit_code=None
+
+        helper_id=(created or {}).get("Id")
+        if not helper_id:
+            raise RuntimeError("backup helper creation returned no container id")
+
+        # Docker start returns HTTP 204 and an empty body.
+        await docker_json("POST",f"/containers/{helper_id}/start",ok=(204,))
+
+        deadline=time.monotonic()+900
+        exit_code=None
         while time.monotonic()<deadline:
-            state=await docker_json("GET",f"/containers/{helper_id}/json"); st=state.get("State") or {}
-            if not st.get("Running"): exit_code=st.get("ExitCode"); break
+            state=await docker_json("GET",f"/containers/{helper_id}/json")
+            st=state.get("State") or {}
+            if not st.get("Running"):
+                exit_code=st.get("ExitCode")
+                break
             await asyncio.sleep(1)
-        if exit_code is None: raise TimeoutError("backup exceeded 15 minutes")
-        if int(exit_code)!=0: raise RuntimeError(f"backup helper exited {exit_code}")
+
+        if exit_code is None:
+            raise TimeoutError("backup exceeded 15 minutes")
+        if int(exit_code)!=0:
+            try:
+                logs=await docker("GET",f"/containers/{helper_id}/logs?stdout=1&stderr=1&tail=100")
+                detail=logs.text[-3000:] if logs is not None else ""
+            except Exception:
+                detail=""
+            raise RuntimeError(f"backup helper exited {exit_code}: {detail}")
     except Exception as e:
         return {"ok":False,"verified":False,"reason":f"{type(e).__name__}: {e}"}
     finally:
         if helper_id:
-            try: await docker_json("DELETE",f"/containers/{helper_id}?force=1")
-            except Exception: pass
+            try:
+                # Docker remove returns 204, no JSON.
+                await docker_json("DELETE",f"/containers/{helper_id}?force=1",ok=(204,))
+            except Exception:
+                pass
+
     ap=backup_root/archive
-    if not ap.exists() or ap.stat().st_size<1: return {"ok":False,"verified":False,"reason":"archive missing or empty"}
+    if not ap.exists() or ap.stat().st_size<1:
+        return {"ok":False,"verified":False,"reason":"archive missing or empty"}
+
     h=hashlib.sha256()
     with ap.open("rb") as fh:
         for chunk in iter(lambda: fh.read(1024*1024), b""):
             h.update(chunk)
     sha=h.hexdigest()
-    detail={"archive":str(ap),"bytes":ap.stat().st_size,"sha256":sha,"mounts":manifest_mounts}
-    Path(str(ap)+".json").write_text(json.dumps({"container_name":container_name,"created_ts":now(),"verified":True,"provider":"kingdom-preupdate",**detail},indent=2))
+
+    detail={
+        "archive":str(ap),
+        "bytes":ap.stat().st_size,
+        "sha256":sha,
+        "mounts":manifest_mounts,
+        "consistency":"filesystem-crash-consistent",
+    }
+    Path(str(ap)+".json").write_text(json.dumps({
+        "container_name":container_name,
+        "created_ts":now(),
+        "verified":True,
+        "provider":"kingdom-preupdate",
+        **detail
+    },indent=2))
+
     with conn() as c:
-        c.execute("""INSERT INTO backup_status(container_name,verified_ts,provider,detail) VALUES(?,?,?,?)
-                     ON CONFLICT(container_name) DO UPDATE SET verified_ts=excluded.verified_ts,provider=excluded.provider,detail=excluded.detail""",
-                  (container_name,now(),"kingdom-preupdate",json.dumps(detail))); c.commit()
-    for old in sorted(backup_root.glob("*.tar.gz"),key=lambda p:p.stat().st_mtime,reverse=True)[max(1,PREUPDATE_BACKUP_RETENTION):]:
-        try: Path(str(old)+".json").unlink(missing_ok=True); old.unlink()
-        except Exception: pass
-    return {"ok":True,"verified":True,"provider":"kingdom-preupdate",**detail}
+        c.execute(
+            """INSERT INTO backup_status(container_name,verified_ts,provider,detail)
+               VALUES(?,?,?,?)
+               ON CONFLICT(container_name) DO UPDATE SET
+                 verified_ts=excluded.verified_ts,
+                 provider=excluded.provider,
+                 detail=excluded.detail""",
+            (container_name,now(),"kingdom-preupdate",json.dumps(detail))
+        )
+        c.commit()
+
+    # Retention is applied only after a new backup is verified.
+    old=sorted(
+        backup_root.glob("*.tar.gz"),
+        key=lambda p:p.stat().st_mtime,
+        reverse=True
+    )
+    for old_archive in old[max(1,PREUPDATE_BACKUP_RETENTION):]:
+        try:
+            Path(str(old_archive)+".json").unlink(missing_ok=True)
+            old_archive.unlink()
+        except Exception:
+            pass
+
+    return {
+        "ok":True,
+        "verified":True,
+        "provider":"kingdom-preupdate",
+        **detail
+    }
 
 @app.post("/api/containers/{name}/preupdate-backup")
 async def preupdate_backup(name: str, authorization: str|None=Header(default=None)):

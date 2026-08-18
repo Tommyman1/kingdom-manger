@@ -3,7 +3,7 @@ services:
     build:
       context: ./app
       dockerfile: Dockerfile
-    image: kingdom-manager:3.2.9
+    image: kingdom-manager:3.2.10
     container_name: kingdom-manager
     restart: unless-stopped
     environment:
@@ -88,6 +88,7 @@ services:
       KM_BACKUP_MAX_AGE_HOURS: "48"
       KM_PREUPDATE_BACKUP_ENABLED: "true"
       KM_PREUPDATE_BACKUP_RETENTION: "5"
+      KM_SELF_CONTAINER: "kingdom-manager"
       KM_AUTO_SAFE_PLAYBOOKS: "true"
       KM_ROLLBACK_RETENTION: "10"
       # Portainer source-of-truth integration.
