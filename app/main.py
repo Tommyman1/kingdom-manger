@@ -16,7 +16,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-VERSION = "3.1.3"
+VERSION = "3.1.4"
 app = FastAPI(title="Kingdom Manager", version=VERSION)
 
 DOCKER = os.getenv("DOCKER_HOST", "tcp://docker-socket-proxy:2375").replace("tcp://", "http://")
@@ -2157,6 +2157,28 @@ async def update_verify(plan_id: int, authorization: str|None=Header(default=Non
     audit('update-verify',p['container_name'],status,{'plan_id':plan_id,'trivy':tri})
     return {'ok':not blocked,'status':status,'plan_id':plan_id,'trivy':tri}
 
+async def _rollback_preflight(plan: dict, snap: dict | None) -> dict:
+    """Refuse an update unless the previous immutable image and config snapshot are usable."""
+    if not snap:
+        return {'ok': False, 'reason': 'rollback snapshot missing'}
+    old_id = str(plan.get('old_image_id') or '')
+    if not old_id:
+        return {'ok': False, 'reason': 'previous immutable image ID missing'}
+    try:
+        r = await docker('GET', f"/images/{quote(old_id, safe='')}/json")
+        if r.status_code != 200:
+            return {'ok': False, 'reason': f'previous image unavailable ({r.status_code})'}
+    except Exception as e:
+        return {'ok': False, 'reason': f'previous image check failed: {type(e).__name__}: {e}'}
+    try:
+        obj = json.loads(snap['inspect_json'])
+        if not isinstance(obj, dict) or not (obj.get('Config') or {}).get('Image'):
+            return {'ok': False, 'reason': 'rollback configuration snapshot is invalid'}
+    except Exception as e:
+        return {'ok': False, 'reason': f'rollback snapshot unreadable: {e}'}
+    return {'ok': True, 'snapshot_id': snap['id'], 'old_image_id': old_id}
+
+
 @app.post('/api/updates/{plan_id}/apply')
 async def update_apply(plan_id: int, authorization: str|None=Header(default=None)):
     require_token(authorization)
@@ -2168,6 +2190,8 @@ async def update_apply(plan_id: int, authorization: str|None=Header(default=None
     if p['status'] not in {'verified','available'}: raise HTTPException(409,'Update plan is not ready')
     with conn() as c: snap=c.execute('SELECT * FROM config_snapshots WHERE id=?',(p['snapshot_id'],)).fetchone()
     if not snap: raise HTTPException(409,'Rollback snapshot missing; update refused')
+    preflight=await _rollback_preflight(dict(p),snap)
+    if not preflight.get('ok'): raise HTTPException(409,'Rollback preflight failed: '+str(preflight.get('reason')))
     obj=json.loads(snap['inspect_json']); mounts=obj.get('Mounts') or []
     if mounts and not UPDATE_ALLOW_STATEFUL:
         raise HTTPException(409,'Stateful container has mounts/volumes. Automatic image rollback cannot reverse data migrations; set KM_UPDATE_ALLOW_STATEFUL=true only after validating application-data backups.')
@@ -2206,6 +2230,17 @@ async def update_rollback(plan_id: int, authorization: str|None=Header(default=N
     audit('rollback',p['container_name'],'success',{'plan_id':plan_id,'snapshot_id':snap['id'],'image_id':p['old_image_id']})
     if DISCORD_NOTIFY_RECOVERY: await notify('Rollback completed',f'{p["container_name"]} restored to immutable image {str(p["old_image_id"])[:24]} from snapshot #{snap["id"]}.','warning',force=True)
     return {'ok':True,'plan_id':plan_id,'restored_image_id':p['old_image_id'],'snapshot_id':snap['id'],'state':state}
+
+@app.get('/api/updates/automation/status')
+async def update_automation_status(authorization: str|None=Header(default=None)):
+    require_token(authorization)
+    cs=await list_containers()
+    rows=[]
+    for x in cs:
+        p=default_policy(x['name']); profile=risk_profile(x['name']).get('profile')
+        rows.append({'container':x['name'],'auto_update':bool(p.get('auto_update')),'protected':bool(p.get('protected')),'ring':int(p.get('update_ring') or 2),'profile':profile,'automatic_apply_eligible':bool(UPDATE_AUTO_APPLY and p.get('auto_update') and not p.get('protected') and int(p.get('update_ring') or 2)<=2)})
+    return {'enabled':UPDATE_ENGINE_ENABLED,'global_auto_apply':UPDATE_AUTO_APPLY,'stateful_auto_apply':UPDATE_ALLOW_STATEFUL,'require_trivy':UPDATE_REQUIRE_TRIVY,'block_critical':UPDATE_BLOCK_CRITICAL,'block_high':UPDATE_BLOCK_HIGH,'containers':rows}
+
 
 @app.get('/api/updates')
 async def updates_list(authorization: str|None=Header(default=None)):
@@ -2249,8 +2284,12 @@ async def update_engine_loop():
                         plan=await update_check(name,f'Bearer {API_TOKEN}')
                         if plan.get('status')=='available':
                             ver=await update_verify(int(plan['plan_id']),f'Bearer {API_TOKEN}')
+                            # Global auto-apply is only an enable switch. Per-container auto_update is still mandatory.
+                            # Rings 3-4 always remain operator-approved even if their policy is accidentally toggled.
                             if UPDATE_AUTO_APPLY and ver.get('ok') and ring<=2:
                                 await update_apply(int(plan['plan_id']),f'Bearer {API_TOKEN}')
+                            elif UPDATE_AUTO_APPLY and ver.get('ok') and ring>2:
+                                event('update_engine',name,{'state':'verified-awaiting-approval','ring':ring},'info')
                     except Exception as e: event('update_engine',name,str(e),'warning')
         except Exception as e: event('update_engine','host',str(e),'warning')
         await asyncio.sleep(max(3600,UPDATE_CHECK_SECONDS))
@@ -2900,7 +2939,7 @@ async function openTrustDiagnostics(){try{let d=await api('/api/suppressions/dia
 function drawHistory(rows){let svg=document.getElementById('historyChart');if(!rows.length){svg.innerHTML='<text x="10" y="55" fill="#8fa3b5">History begins after this upgrade.</text>';document.getElementById('historyMeta').textContent='';return}let w=500,h=110,min=Math.min(...rows.map(x=>x.score)),max=Math.max(...rows.map(x=>x.score));let pts=rows.map((x,i)=>`${(i/(Math.max(1,rows.length-1))*w).toFixed(1)},${(h-10-(x.score/100)*(h-20)).toFixed(1)}`).join(' ');svg.innerHTML=`<polyline fill="none" stroke="#32b7ff" stroke-width="3" points="${pts}"/><line x1="0" y1="${h-10-0.75*(h-20)}" x2="500" y2="${h-10-0.75*(h-20)}" stroke="#294153" stroke-dasharray="4 4"/>`;document.getElementById('historyMeta').textContent=`${rows[0].score} → ${rows[rows.length-1].score} · range ${min}–${max}`}
 async function checkUpdate(n){try{toast('Capturing rollback snapshot and checking image…','warn');let p=await api(`/api/updates/${encodeURIComponent(n)}/check`,{method:'POST'});if(p.status==='current'){toast(`${n} is current. Rollback snapshot saved.`,'ok');return}let v=await api(`/api/updates/${p.plan_id}/verify`,{method:'POST'});if(!v.ok){toast(`Update blocked by verification for ${n}`,'error');return}let ok=await kmDialog({title:`Apply verified update to ${n}?`,text:`Rollback snapshot #${p.rollback_snapshot.snapshot_id} is ready. If post-update health fails, Kingdom will automatically restore image ${String(p.old_image_id).slice(0,28)}…`,ok:'Apply Update',danger:true});if(!ok)return;let r=await api(`/api/updates/${p.plan_id}/apply`,{method:'POST'});toast(r.ok?'Update completed; rollback remains available.':'Update failed','ok');load()}catch(e){toast(e.message,'error')}}
 async function rollbackUpdate(id,n){if(!(await kmDialog({title:`Rollback ${n}?`,text:'Kingdom will recreate the container from its saved pre-update Docker configuration and immutable previous image ID.',ok:'Rollback',danger:true})))return;try{let r=await api(`/api/updates/${id}/rollback`,{method:'POST'});toast(`Rollback completed for ${n}`,'ok');openUpdates();load()}catch(e){toast(e.message,'error')}}
-async function openUpdates(){try{let rows=await api('/api/updates');document.getElementById('drawerTitle').textContent='Update & Rollback Center';document.getElementById('drawerSubtitle').textContent='Staged image verification · immutable rollback snapshots · audit trail';document.getElementById('drawerBody').innerHTML=`<section><h3>SAFE UPDATE MODEL</h3><p class="muted">Kingdom captures the exact running image ID, environment, labels, mounts, restart policy, ports and networks before pulling a candidate. Verified updates can be rolled back to that immutable image/configuration.</p></section><section><h3>RECENT UPDATE PLANS</h3>${rows.map(x=>`<div class="event"><div><strong>${esc(x.container_name)}</strong><span class="tiny">#${x.id} · ${esc(x.status)} · ${new Date(x.created_ts*1000).toLocaleString()}<br>${esc(String(x.old_image_id||'').slice(0,22))} → ${esc(String(x.candidate_image_id||'').slice(0,22))}</span></div><div class="toolbar">${['completed','failed','rolled-back'].includes(x.status)?`<button onclick="rollbackUpdate(${x.id},'${esc(x.container_name)}')">Rollback</button>`:''}</div></div>`).join('')||'<div class="tiny">No update checks yet.</div>'}</section>`;document.getElementById('drawer').classList.remove('hidden')}catch(e){toast(e.message,'error')}}
+async function openUpdates(){try{let rows=await api('/api/updates');document.getElementById('drawerTitle').textContent='Update & Rollback Center';document.getElementById('drawerSubtitle').textContent='Per-container Auto-Update · Trivy gate · immutable rollback · automatic health rollback';document.getElementById('drawerBody').innerHTML=`<section><h3>SAFE UPDATE MODEL</h3><p class="muted">Auto-Update is opt-in per container. Kingdom captures the exact running image/configuration, verifies the candidate with Trivy, refuses unsafe stateful updates, observes health after replacement, and automatically rolls back a failed update. Rings 3–4 remain manual.</p></section><section><h3>RECENT UPDATE PLANS</h3>${rows.map(x=>`<div class="event"><div><strong>${esc(x.container_name)}</strong><span class="tiny">#${x.id} · ${esc(x.status)} · ${new Date(x.created_ts*1000).toLocaleString()}<br>${esc(String(x.old_image_id||'').slice(0,22))} → ${esc(String(x.candidate_image_id||'').slice(0,22))}</span></div><div class="toolbar">${['completed','failed','rolled-back'].includes(x.status)?`<button class="btn-secondary btn-compact" onclick="rollbackUpdate(${x.id},'${esc(x.container_name)}')">↶ Rollback</button>`:''}</div></div>`).join('')||'<div class="tiny">No update checks yet.</div>'}</section>`;document.getElementById('drawer').classList.remove('hidden')}catch(e){toast(e.message,'error')}}
 async function testDiscord(){try{let r=await api('/api/discord/test',{method:'POST'});toast('Discord test sent · '+r.discord,'ok')}catch(e){toast(e.message,'error')}}
 async function openRecoveryCenter(){try{let rows=await api('/api/disaster-recovery');document.getElementById('drawerTitle').textContent='Disaster Recovery Center';document.getElementById('drawerSubtitle').textContent='Immutable image/config snapshots · dry-run validation · data-backup awareness';document.getElementById('drawerBody').innerHTML=`<section><div class="tiny">Image/config rollback can restore Docker state. Stateful application data requires a separate verified backup.</div></section><section>${rows.slice(0,80).map(x=>`<div class="event"><div><strong>${esc(x.container_name)} · snapshot #${x.id}</strong><span class="tiny">${new Date(x.ts*1000).toLocaleString()} · ${esc(x.reason)}<br>image ${esc(String(x.image_id||'').slice(0,24))} · ${x.image_present?'image ready':'image missing'} · ${x.data_backup_verified?'data backup verified':'data backup unverified'}${x.compose_source?' · compose '+esc(x.compose_source):''}</span></div><button onclick="testRecovery(${x.id})">Test</button></div>`).join('')||'<div class="tiny">No rollback snapshots yet.</div>'}</section>`;document.getElementById('drawer').classList.remove('hidden')}catch(e){toast(e.message,'error')}}
 async function testRecovery(id){try{let r=await api(`/api/disaster-recovery/${id}/test`,{method:'POST'});toast(r.ok?'Rollback dry-run passed':'Rollback dry-run has warnings',r.ok?'ok':'warn');openRecoveryCenter()}catch(e){toast(e.message,'error')}}
