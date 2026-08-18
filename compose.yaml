@@ -3,7 +3,7 @@ services:
     build:
       context: ./app
       dockerfile: Dockerfile
-    image: kingdom-manager:3.2.0
+    image: kingdom-manager:3.2.1
     container_name: kingdom-manager
     restart: unless-stopped
     environment:
@@ -87,10 +87,14 @@ services:
       KM_BACKUP_MAX_AGE_HOURS: "48"
       KM_AUTO_SAFE_PLAYBOOKS: "true"
       KM_ROLLBACK_RETENTION: "10"
-      # Optional Portainer compose capture. Leave blank unless configured.
+      # Portainer source-of-truth integration.
+      # Set URL + API key to let Kingdom auto-map containers to Portainer stacks
+      # using Docker Compose project/service labels. STACK_ID is fallback only.
       PORTAINER_URL: ""
       PORTAINER_API_KEY: ""
+      PORTAINER_ENDPOINT_ID: ""
       PORTAINER_STACK_ID: ""
+      PORTAINER_VERIFY_TLS: "false"
       KM_COMPOSE_SNAPSHOT_PATH: ""
     volumes:
       - kingdom-manager-data:/data

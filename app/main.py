@@ -16,7 +16,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-VERSION = "3.2.0"
+VERSION = "3.2.1"
 app = FastAPI(title="Kingdom Manager", version=VERSION)
 
 DOCKER = os.getenv("DOCKER_HOST", "tcp://docker-socket-proxy:2375").replace("tcp://", "http://")
@@ -94,7 +94,11 @@ UPDATE_ALLOW_STATEFUL = os.getenv("KM_UPDATE_ALLOW_STATEFUL", "false").lower() i
 ROLLBACK_RETENTION = int(os.getenv("KM_ROLLBACK_RETENTION", "10"))
 PORTAINER_URL = os.getenv("PORTAINER_URL", "").rstrip('/')
 PORTAINER_API_KEY = os.getenv("PORTAINER_API_KEY", "")
-PORTAINER_STACK_ID = os.getenv("PORTAINER_STACK_ID", "")
+# Optional fallbacks. Normal Portainer-managed containers are auto-mapped from
+# com.docker.compose.project / com.docker.compose.service labels.
+PORTAINER_STACK_ID = os.getenv("PORTAINER_STACK_ID", "").strip()
+PORTAINER_ENDPOINT_ID = os.getenv("PORTAINER_ENDPOINT_ID", "").strip()
+PORTAINER_VERIFY_TLS = os.getenv("PORTAINER_VERIFY_TLS", "false").lower() in {"1","true","yes","on"}
 COMPOSE_SNAPSHOT_PATH = os.getenv("KM_COMPOSE_SNAPSHOT_PATH", "")
 DASHBOARD_URL = os.getenv("KM_DASHBOARD_URL", "https://kingdom-manager-tail.kingdom.local").rstrip("/")
 DISCORD_ROLE_ID = os.getenv("DISCORD_MENTION_ROLE_ID", "").strip()
@@ -105,7 +109,7 @@ DRIFT_SCAN_ENABLED = os.getenv("KM_DRIFT_SCAN_ENABLED", "true").lower() in {"1",
 DRIFT_SCAN_SECONDS = int(os.getenv("KM_DRIFT_SCAN_SECONDS", "1800"))
 BACKUP_MAX_AGE_HOURS = int(os.getenv("KM_BACKUP_MAX_AGE_HOURS", "48"))
 AUTO_SAFE_PLAYBOOKS = os.getenv("KM_AUTO_SAFE_PLAYBOOKS", "true").lower() in {"1","true","yes","on"}
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -194,7 +198,7 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS recovery_steps(id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER NOT NULL, ts INTEGER NOT NULL,step TEXT NOT NULL, status TEXT NOT NULL, detail TEXT, FOREIGN KEY(plan_id) REFERENCES recovery_plans(id) ON DELETE CASCADE);
         CREATE TABLE IF NOT EXISTS playbook_runs(id INTEGER PRIMARY KEY AUTOINCREMENT, incident_id INTEGER NOT NULL, created_ts INTEGER NOT NULL, completed_ts INTEGER, status TEXT NOT NULL DEFAULT 'running', plan_json TEXT NOT NULL DEFAULT '{}', result_json TEXT NOT NULL DEFAULT '{}', FOREIGN KEY(incident_id) REFERENCES incidents(id) ON DELETE CASCADE);
         CREATE TABLE IF NOT EXISTS sensor_health_history(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, sensor TEXT NOT NULL, status TEXT NOT NULL, detail TEXT, latency_ms INTEGER);
-        CREATE TABLE IF NOT EXISTS config_snapshots(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, container_name TEXT NOT NULL, reason TEXT NOT NULL, image_ref TEXT, image_id TEXT, inspect_json TEXT NOT NULL, compose_text TEXT, compose_source TEXT, env_json TEXT NOT NULL DEFAULT '[]', labels_json TEXT NOT NULL DEFAULT '{}', networks_json TEXT NOT NULL DEFAULT '{}', verified INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS config_snapshots(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, container_name TEXT NOT NULL, reason TEXT NOT NULL, image_ref TEXT, image_id TEXT, inspect_json TEXT NOT NULL, compose_text TEXT, compose_source TEXT, stack_meta_json TEXT NOT NULL DEFAULT '{}', env_json TEXT NOT NULL DEFAULT '[]', labels_json TEXT NOT NULL DEFAULT '{}', networks_json TEXT NOT NULL DEFAULT '{}', verified INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS update_plans(id INTEGER PRIMARY KEY AUTOINCREMENT, created_ts INTEGER NOT NULL, container_name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'detected', snapshot_id INTEGER, image_ref TEXT NOT NULL, old_image_id TEXT, candidate_image_id TEXT, scan_json TEXT, result_json TEXT NOT NULL DEFAULT '{}', approved_ts INTEGER, executed_ts INTEGER, rollback_snapshot_id INTEGER);
         CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, actor TEXT NOT NULL DEFAULT 'kingdom', action TEXT NOT NULL, subject TEXT, outcome TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '{}');
         CREATE TABLE IF NOT EXISTS config_baselines(container_name TEXT PRIMARY KEY, ts INTEGER NOT NULL, fingerprint TEXT NOT NULL, config_json TEXT NOT NULL, actor TEXT NOT NULL DEFAULT 'operator');
@@ -220,6 +224,7 @@ def init_db() -> None:
         _ensure_column(c, 'suppressions', 'created_ts', 'INTEGER')
         _ensure_column(c, 'incident_assessments', 'score_snapshot', 'INTEGER')
         _ensure_column(c, 'incident_assessments', 'details_json', "TEXT DEFAULT '{}'")
+        _ensure_column(c, 'config_snapshots', 'stack_meta_json', "TEXT NOT NULL DEFAULT '{}'")
         c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('schema_version',?)", (str(SCHEMA_VERSION),))
 
 
@@ -2161,34 +2166,181 @@ def audit(action: str, subject: str, outcome: str, detail: Any=None, actor: str=
     with conn() as c:
         c.execute("INSERT INTO audit_log(ts,actor,action,subject,outcome,detail) VALUES(?,?,?,?,?,?)",(now(),actor,action,subject,outcome,json.dumps(detail or {},default=str)[:100000]))
 
-async def _capture_portainer_compose() -> tuple[str|None,str|None]:
+async def _portainer_request(method: str, path: str, **kwargs) -> httpx.Response:
+    if not PORTAINER_URL or not PORTAINER_API_KEY:
+        raise RuntimeError("Portainer API is not configured")
+    headers=dict(kwargs.pop("headers", {}) or {})
+    headers["X-API-Key"]=PORTAINER_API_KEY
+    timeout=kwargs.pop("timeout", 45)
+    async with httpx.AsyncClient(timeout=timeout,verify=PORTAINER_VERIFY_TLS) as client:
+        return await client.request(method, PORTAINER_URL + path, headers=headers, **kwargs)
+
+
+def _compose_identity(obj: dict) -> dict:
+    labels=(obj.get("Config") or {}).get("Labels") or {}
+    return {
+        "project": str(labels.get("com.docker.compose.project") or "").strip(),
+        "service": str(labels.get("com.docker.compose.service") or "").strip(),
+        "working_dir": str(labels.get("com.docker.compose.project.working_dir") or "").strip(),
+        "config_files": str(labels.get("com.docker.compose.project.config_files") or "").strip(),
+    }
+
+
+async def _resolve_portainer_stack(obj: dict) -> dict | None:
+    """Map a running Compose container to its Portainer stack without a global stack ID."""
+    if not PORTAINER_URL or not PORTAINER_API_KEY:
+        return None
+    ident=_compose_identity(obj)
+    project=ident["project"]
+    service=ident["service"]
+    try:
+        r=await _portainer_request("GET", "/api/stacks", timeout=20)
+        if r.status_code != 200:
+            event("portainer_resolve","host",f"stack list HTTP {r.status_code}: {r.text[:300]}","warning")
+            return None
+        stacks=r.json() if isinstance(r.json(),list) else []
+        chosen=None
+        # Compose project label is normally the Portainer stack Name.
+        if project:
+            exact=[x for x in stacks if str(x.get("Name") or "").strip()==project]
+            if len(exact)==1:
+                chosen=exact[0]
+            elif len(exact)>1 and PORTAINER_ENDPOINT_ID:
+                chosen=next((x for x in exact if str(x.get("EndpointId") or "")==PORTAINER_ENDPOINT_ID), exact[0])
+        # Explicit stack ID is a backwards-compatible fallback only.
+        if chosen is None and PORTAINER_STACK_ID:
+            chosen=next((x for x in stacks if str(x.get("Id") or "")==PORTAINER_STACK_ID), None)
+        if chosen is None:
+            return None
+        sid=int(chosen.get("Id"))
+        endpoint=int(chosen.get("EndpointId") or PORTAINER_ENDPOINT_ID or 0)
+        if endpoint <= 0:
+            event("portainer_resolve",project or "host","Portainer stack has no endpoint ID","warning")
+            return None
+
+        meta_resp=await _portainer_request("GET",f"/api/stacks/{sid}",timeout=20)
+        meta=meta_resp.json() if meta_resp.status_code==200 and isinstance(meta_resp.json(),dict) else dict(chosen)
+        file_resp=await _portainer_request("GET",f"/api/stacks/{sid}/file",timeout=20)
+        if file_resp.status_code != 200:
+            event("portainer_resolve",project or str(sid),f"stack file HTTP {file_resp.status_code}: {file_resp.text[:300]}","warning")
+            return None
+        fd=file_resp.json()
+        compose=str(fd.get("StackFileContent") or fd.get("stackFileContent") or "") if isinstance(fd,dict) else ""
+        if not compose:
+            return None
+        return {
+            "stack_id":sid,
+            "endpoint_id":endpoint,
+            "stack_name":str(meta.get("Name") or chosen.get("Name") or project),
+            "project":project,
+            "service":service,
+            "env":meta.get("Env") or [],
+            "compose":compose[:500000],
+            "working_dir":ident["working_dir"],
+            "config_files":ident["config_files"],
+        }
+    except Exception as e:
+        event("portainer_resolve",project or "host",f"{type(e).__name__}: {e}","warning")
+        return None
+
+
+async def _capture_compose_for_container(obj: dict) -> tuple[str|None,str|None,dict]:
+    # A deliberately configured local compose file remains a supported source.
     if COMPOSE_SNAPSHOT_PATH:
         try:
             q=Path(COMPOSE_SNAPSHOT_PATH)
-            if q.exists() and q.is_file(): return q.read_text(errors='replace')[:500000],f'file:{q}'
-        except Exception: pass
-    if PORTAINER_URL and PORTAINER_API_KEY and PORTAINER_STACK_ID:
+            if q.exists() and q.is_file():
+                return q.read_text(errors="replace")[:500000],f"file:{q}",{"mode":"file","path":str(q)}
+        except Exception as e:
+            event("compose_snapshot","host",str(e),"warning")
+
+    pm=await _resolve_portainer_stack(obj)
+    if pm:
+        meta={k:v for k,v in pm.items() if k!="compose"}
+        return pm["compose"],f"portainer-stack:{pm['stack_id']}",meta
+    return None,None,{}
+
+
+async def _portainer_redeploy(meta: dict, compose_text: str, *, pull_image: bool=True) -> dict:
+    sid=int(meta.get("stack_id") or 0)
+    endpoint=int(meta.get("endpoint_id") or 0)
+    if sid<=0 or endpoint<=0:
+        raise RuntimeError("Portainer stack metadata is incomplete")
+    payload={
+        "stackFileContent":compose_text,
+        "env":meta.get("env") or [],
+        "prune":False,
+        "pullImage":bool(pull_image),
+    }
+    r=await _portainer_request(
+        "PUT",
+        f"/api/stacks/{sid}?endpointId={endpoint}",
+        json=payload,
+        timeout=max(120, UPDATE_OBSERVATION_SECONDS + 90),
+    )
+    if r.status_code not in (200,201):
+        raise RuntimeError(f"Portainer stack update failed HTTP {r.status_code}: {r.text[:1200]}")
+    try:
+        body=r.json()
+    except Exception:
+        body={"text":r.text[:1000]}
+    return {"stack_id":sid,"endpoint_id":endpoint,"stack_name":meta.get("stack_name"),"response":body}
+
+
+async def _observe_container_after_stack_update(name: str) -> dict:
+    # Portainer may remove/recreate the container. Give Compose time to settle.
+    deadline=time.monotonic()+max(20,UPDATE_OBSERVATION_SECONDS)
+    last={}
+    await asyncio.sleep(3)
+    while time.monotonic()<deadline:
         try:
-            async with httpx.AsyncClient(timeout=15,verify=False) as client:
-                r=await client.get(f"{PORTAINER_URL}/api/stacks/{PORTAINER_STACK_ID}/file",headers={'X-API-Key':PORTAINER_API_KEY})
-                if r.status_code==200:
-                    data=r.json(); text=data.get('StackFileContent') if isinstance(data,dict) else None
-                    if text: return str(text)[:500000],f'portainer-stack:{PORTAINER_STACK_ID}'
-        except Exception as e: event('portainer_snapshot','host',str(e),'warning')
-    return None,None
+            obj=await inspect_container(name)
+            st=obj.get("State") or {}
+            last={
+                "running":bool(st.get("Running")),
+                "status":st.get("Status"),
+                "health":(st.get("Health") or {}).get("Status"),
+                "image_id":obj.get("Image"),
+            }
+            if last["running"] and last["health"]!="unhealthy":
+                # Healthy or no Docker healthcheck. Require a short stability interval.
+                await asyncio.sleep(min(8,max(2,UPDATE_OBSERVATION_SECONDS//6)))
+                obj2=await inspect_container(name)
+                st2=obj2.get("State") or {}
+                result={
+                    "running":bool(st2.get("Running")),
+                    "status":st2.get("Status"),
+                    "health":(st2.get("Health") or {}).get("Status"),
+                    "image_id":obj2.get("Image"),
+                }
+                if result["running"] and result["health"]!="unhealthy":
+                    return result
+        except Exception as e:
+            last={"error":f"{type(e).__name__}: {e}"}
+        await asyncio.sleep(3)
+    raise RuntimeError("Portainer redeploy did not pass health observation: "+json.dumps(last,default=str))
+
 
 async def capture_config_snapshot(name: str, reason: str) -> dict:
     obj=await inspect_container(name); cfg=obj.get('Config') or {}; nets=(obj.get('NetworkSettings') or {}).get('Networks') or {}
-    compose,source=await _capture_portainer_compose()
+    compose,source,stack_meta=await _capture_compose_for_container(obj)
     with conn() as c:
-        cur=c.execute("INSERT INTO config_snapshots(ts,container_name,reason,image_ref,image_id,inspect_json,compose_text,compose_source,env_json,labels_json,networks_json,verified) VALUES(?,?,?,?,?,?,?,?,?,?,?,1)",
-          (now(),name,reason,cfg.get('Image'),obj.get('Image'),json.dumps(obj,default=str),compose,source,json.dumps(cfg.get('Env') or []),json.dumps(cfg.get('Labels') or {}),json.dumps(nets,default=str)))
+        cur=c.execute("INSERT INTO config_snapshots(ts,container_name,reason,image_ref,image_id,inspect_json,compose_text,compose_source,stack_meta_json,env_json,labels_json,networks_json,verified) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1)",
+          (now(),name,reason,cfg.get('Image'),obj.get('Image'),json.dumps(obj,default=str),compose,source,json.dumps(stack_meta,default=str),json.dumps(cfg.get('Env') or []),json.dumps(cfg.get('Labels') or {}),json.dumps(nets,default=str)))
         sid=cur.lastrowid
-        # Retention is per container, but never delete snapshots referenced by an active update plan.
         old=c.execute("SELECT id FROM config_snapshots WHERE container_name=? ORDER BY id DESC LIMIT -1 OFFSET ?",(name,max(1,ROLLBACK_RETENTION))).fetchall()
-        for r in old: c.execute("DELETE FROM config_snapshots WHERE id=? AND id NOT IN (SELECT COALESCE(snapshot_id,-1) FROM update_plans UNION SELECT COALESCE(rollback_snapshot_id,-1) FROM update_plans)",(r['id'],))
-    audit('snapshot',name,'success',{'snapshot_id':sid,'image_id':obj.get('Image'),'compose_source':source})
-    return {'snapshot_id':sid,'image_ref':cfg.get('Image'),'image_id':obj.get('Image'),'compose_saved':bool(compose),'compose_source':source}
+        for r in old:
+            c.execute("DELETE FROM config_snapshots WHERE id=? AND id NOT IN (SELECT COALESCE(snapshot_id,-1) FROM update_plans UNION SELECT COALESCE(rollback_snapshot_id,-1) FROM update_plans)",(r['id'],))
+    audit('snapshot',name,'success',{'snapshot_id':sid,'image_id':obj.get('Image'),'compose_source':source,'portainer_stack':stack_meta.get('stack_id')})
+    return {
+        'snapshot_id':sid,'image_ref':cfg.get('Image'),'image_id':obj.get('Image'),
+        'compose_saved':bool(compose),'compose_source':source,
+        'portainer_managed':bool(stack_meta.get('stack_id')),
+        'portainer_stack_id':stack_meta.get('stack_id'),
+        'portainer_stack_name':stack_meta.get('stack_name'),
+        'portainer_service':stack_meta.get('service'),
+    }
+
 
 async def _recreate_from_inspect(name: str, obj: dict, image_override: str|None=None, quarantine: bool=False) -> dict:
     cfg=dict(obj.get('Config') or {}); hc=dict(obj.get('HostConfig') or {}); nets=(obj.get('NetworkSettings') or {}).get('Networks') or {}
@@ -2279,49 +2431,102 @@ async def _rollback_preflight(plan: dict, snap: dict | None) -> dict:
         obj = json.loads(snap['inspect_json'])
         if not isinstance(obj, dict) or not (obj.get('Config') or {}).get('Image'):
             return {'ok': False, 'reason': 'rollback configuration snapshot is invalid'}
+        stack_meta=json.loads(snap['stack_meta_json'] or '{}')
+        if stack_meta.get('stack_id') and not str(snap['compose_text'] or '').strip():
+            return {'ok': False, 'reason': 'Portainer rollback stack file is missing'}
     except Exception as e:
         return {'ok': False, 'reason': f'rollback snapshot unreadable: {e}'}
-    return {'ok': True, 'snapshot_id': snap['id'], 'old_image_id': old_id}
+    return {'ok': True, 'snapshot_id': snap['id'], 'old_image_id': old_id, 'portainer_stack_id': stack_meta.get('stack_id') if isinstance(stack_meta,dict) else None}
 
 
 @app.post('/api/updates/{plan_id}/apply')
 async def update_apply(plan_id: int, authorization: str|None=Header(default=None)):
     require_token(authorization)
-    with conn() as c: p=c.execute('SELECT * FROM update_plans WHERE id=?',(plan_id,)).fetchone()
+    with conn() as c:
+        p=c.execute('SELECT * FROM update_plans WHERE id=?',(plan_id,)).fetchone()
     if not p: raise HTTPException(404,'Update plan not found')
     name=p['container_name']; pol=default_policy(name)
     if pol.get('protected'): raise HTTPException(409,'Protected container cannot be auto-updated')
-    if risk_profile(name).get('profile') in {'database','security','critical-infrastructure'} and not p['status']=='verified': raise HTTPException(409,'Critical service update must be verified first')
-    if p['status'] not in {'verified','available'}: raise HTTPException(409,'Update plan is not ready')
-    with conn() as c: snap=c.execute('SELECT * FROM config_snapshots WHERE id=?',(p['snapshot_id'],)).fetchone()
+    if pol.get('local_build'): raise HTTPException(409,'Local Build containers must be rebuilt from source, not registry-updated')
+    if risk_profile(name).get('profile') in {'database','security','critical-infrastructure'} and not p['status']=='verified':
+        raise HTTPException(409,'Critical service update must be verified first')
+    if p['status'] not in {'verified','available'}:
+        raise HTTPException(409,'Update plan is not ready')
+    with conn() as c:
+        snap=c.execute('SELECT * FROM config_snapshots WHERE id=?',(p['snapshot_id'],)).fetchone()
     if not snap: raise HTTPException(409,'Rollback snapshot missing; update refused')
+
     preflight=await _rollback_preflight(dict(p),snap)
-    if not preflight.get('ok'): raise HTTPException(409,'Rollback preflight failed: '+str(preflight.get('reason')))
+    if not preflight.get('ok'):
+        raise HTTPException(409,'Rollback preflight failed: '+str(preflight.get('reason')))
+
     obj=json.loads(snap['inspect_json']); mounts=obj.get('Mounts') or []
     if mounts and not UPDATE_ALLOW_STATEFUL:
         raise HTTPException(409,'Stateful container has mounts/volumes. Automatic image rollback cannot reverse data migrations; set KM_UPDATE_ALLOW_STATEFUL=true only after validating application-data backups.')
     if mounts and UPDATE_ALLOW_STATEFUL and pol.get('require_backup'):
-        with conn() as c: b=c.execute('SELECT verified_ts,provider FROM backup_status WHERE container_name=?',(name,)).fetchone()
+        with conn() as c:
+            b=c.execute('SELECT verified_ts,provider FROM backup_status WHERE container_name=?',(name,)).fetchone()
         if not b or now()-int(b['verified_ts'])>BACKUP_MAX_AGE_HOURS*3600:
             raise HTTPException(409,f'Stateful update requires a verified data backup newer than {BACKUP_MAX_AGE_HOURS}h. Mark backup status in Disaster Recovery before applying.')
-    result={'old_image_id':p['old_image_id'],'candidate_image_id':p['candidate_image_id'],'snapshot_id':p['snapshot_id']}
+
     try:
-        state=await _recreate_from_inspect(name,obj,p['candidate_image_id'],False); result['state']=state
-        with conn() as c: c.execute("UPDATE update_plans SET status='completed',approved_ts=?,executed_ts=?,result_json=? WHERE id=?",(now(),now(),json.dumps(result,default=str),plan_id))
-        audit('update-apply',name,'success',{'plan_id':plan_id,**result}); event('update',name,{'plan_id':plan_id,'state':'completed'},'info')
-        if DISCORD_NOTIFY_UPDATES: await notify('Update completed',f'{name} updated successfully. Rollback snapshot #{p["snapshot_id"]} remains available.','info',force=True)
+        stack_meta=json.loads(snap['stack_meta_json'] or '{}')
+    except Exception:
+        stack_meta={}
+    compose_text=str(snap['compose_text'] or '')
+    portainer_managed=bool(stack_meta.get('stack_id') and compose_text)
+
+    result={
+        'old_image_id':p['old_image_id'],
+        'candidate_image_id':p['candidate_image_id'],
+        'snapshot_id':p['snapshot_id'],
+        'source_of_truth':'portainer-stack' if portainer_managed else 'docker-inspect',
+    }
+
+    try:
+        if portainer_managed:
+            # Keep the stack YAML exactly as Portainer stored it. pullImage=true causes
+            # mutable tags to refresh while preserving every other Compose setting.
+            result['portainer']=await _portainer_redeploy(stack_meta,compose_text,pull_image=True)
+            invalidate_container_cache()
+            state=await _observe_container_after_stack_update(name)
+            result['state']=state
+            # Candidate check: the redeployed container must actually be on the image
+            # pulled during update_check, otherwise do not claim success.
+            if p['candidate_image_id'] and state.get('image_id') and str(state['image_id'])!=str(p['candidate_image_id']):
+                raise RuntimeError(f"Portainer redeploy remained on image {state.get('image_id')} instead of candidate {p['candidate_image_id']}")
+        else:
+            state=await _recreate_from_inspect(name,obj,p['candidate_image_id'],False)
+            result['state']=state
+
+        with conn() as c:
+            c.execute("UPDATE update_plans SET status='completed',approved_ts=?,executed_ts=?,result_json=? WHERE id=?",(now(),now(),json.dumps(result,default=str),plan_id))
+        audit('update-apply',name,'success',{'plan_id':plan_id,**result})
+        event('update',name,{'plan_id':plan_id,'state':'completed','source_of_truth':result['source_of_truth']},'info')
+        if DISCORD_NOTIFY_UPDATES:
+            await notify('Update completed',f'{name} updated successfully through {result["source_of_truth"]}. Rollback snapshot #{p["snapshot_id"]} remains available.','info',force=True)
         return {'ok':True,'plan_id':plan_id,'rollback_available':True,**result}
+
     except Exception as e:
         result['error']=str(e)
-        # Automatic rollback is safer than leaving a failed update in place.
+        # Portainer stack rollback restores the exact pre-update stack file.
         try:
-            rb=await _recreate_from_inspect(name,obj,p['old_image_id'],False); result['automatic_rollback']=rb; status='rolled-back'
+            if portainer_managed:
+                result['automatic_rollback_portainer']=await _portainer_redeploy(stack_meta,compose_text,pull_image=False)
+                invalidate_container_cache()
+                rb=await _observe_container_after_stack_update(name)
+            else:
+                rb=await _recreate_from_inspect(name,obj,p['old_image_id'],False)
+            result['automatic_rollback']=rb
+            status='rolled-back'
         except Exception as re:
             result['rollback_error']=str(re); status='failed'
             try: await isolate(name)
             except Exception: pass
-        with conn() as c: c.execute('UPDATE update_plans SET status=?,executed_ts=?,result_json=? WHERE id=?',(status,now(),json.dumps(result,default=str),plan_id))
-        audit('update-apply',name,status,{'plan_id':plan_id,**result}); raise HTTPException(500,result)
+        with conn() as c:
+            c.execute('UPDATE update_plans SET status=?,executed_ts=?,result_json=? WHERE id=?',(status,now(),json.dumps(result,default=str),plan_id))
+        audit('update-apply',name,status,{'plan_id':plan_id,**result})
+        raise HTTPException(500,result)
 
 @app.post('/api/updates/{plan_id}/rollback')
 async def update_rollback(plan_id: int, authorization: str|None=Header(default=None)):
@@ -2330,11 +2535,28 @@ async def update_rollback(plan_id: int, authorization: str|None=Header(default=N
         p=c.execute('SELECT * FROM update_plans WHERE id=?',(plan_id,)).fetchone()
         snap=c.execute('SELECT * FROM config_snapshots WHERE id=(SELECT rollback_snapshot_id FROM update_plans WHERE id=?)',(plan_id,)).fetchone()
     if not p or not snap: raise HTTPException(404,'Rollback plan/snapshot not found')
-    obj=json.loads(snap['inspect_json']); state=await _recreate_from_inspect(p['container_name'],obj,p['old_image_id'],False)
-    with conn() as c: c.execute("UPDATE update_plans SET status='rolled-back',executed_ts=?,result_json=? WHERE id=?",(now(),json.dumps({'manual_rollback':state},default=str),plan_id))
-    audit('rollback',p['container_name'],'success',{'plan_id':plan_id,'snapshot_id':snap['id'],'image_id':p['old_image_id']})
-    if DISCORD_NOTIFY_RECOVERY: await notify('Rollback completed',f'{p["container_name"]} restored to immutable image {str(p["old_image_id"])[:24]} from snapshot #{snap["id"]}.','warning',force=True)
-    return {'ok':True,'plan_id':plan_id,'restored_image_id':p['old_image_id'],'snapshot_id':snap['id'],'state':state}
+    name=p['container_name']; obj=json.loads(snap['inspect_json'])
+    try:
+        stack_meta=json.loads(snap['stack_meta_json'] or '{}')
+    except Exception:
+        stack_meta={}
+    compose_text=str(snap['compose_text'] or '')
+    if stack_meta.get('stack_id') and compose_text:
+        redeploy=await _portainer_redeploy(stack_meta,compose_text,pull_image=False)
+        invalidate_container_cache()
+        state=await _observe_container_after_stack_update(name)
+        source='portainer-stack'
+        detail={'manual_rollback':state,'portainer':redeploy}
+    else:
+        state=await _recreate_from_inspect(name,obj,p['old_image_id'],False)
+        source='docker-inspect'
+        detail={'manual_rollback':state}
+    with conn() as c:
+        c.execute("UPDATE update_plans SET status='rolled-back',executed_ts=?,result_json=? WHERE id=?",(now(),json.dumps(detail,default=str),plan_id))
+    audit('rollback',name,'success',{'plan_id':plan_id,'snapshot_id':snap['id'],'image_id':p['old_image_id'],'source_of_truth':source})
+    if DISCORD_NOTIFY_RECOVERY:
+        await notify('Rollback completed',f'{name} restored through {source} from snapshot #{snap["id"]}.','warning',force=True)
+    return {'ok':True,'plan_id':plan_id,'restored_image_id':p['old_image_id'],'snapshot_id':snap['id'],'source_of_truth':source,'state':state}
 
 @app.get('/api/updates/automation/status')
 async def update_automation_status(authorization: str|None=Header(default=None)):
@@ -2343,7 +2565,7 @@ async def update_automation_status(authorization: str|None=Header(default=None))
     rows=[]
     for x in cs:
         p=default_policy(x['name']); profile=risk_profile(x['name']).get('profile')
-        rows.append({'container':x['name'],'auto_update':bool(p.get('auto_update')),'local_build':bool(p.get('local_build')),'protected':bool(p.get('protected')),'ring':int(p.get('update_ring') or 2),'profile':profile,'automatic_apply_eligible':bool(UPDATE_AUTO_APPLY and p.get('auto_update') and not p.get('local_build') and not p.get('protected') and int(p.get('update_ring') or 2)<=2)})
+        rows.append({'container':x['name'],'auto_update':bool(p.get('auto_update')),'local_build':bool(p.get('local_build')),'protected':bool(p.get('protected')),'ring':int(p.get('update_ring') or 2),'profile':profile,'portainer_api_configured':bool(PORTAINER_URL and PORTAINER_API_KEY),'automatic_apply_eligible':bool(UPDATE_AUTO_APPLY and p.get('auto_update') and not p.get('local_build') and not p.get('protected') and int(p.get('update_ring') or 2)<=2)})
     return {'enabled':UPDATE_ENGINE_ENABLED,'global_auto_apply':UPDATE_AUTO_APPLY,'stateful_auto_apply':UPDATE_ALLOW_STATEFUL,'require_trivy':UPDATE_REQUIRE_TRIVY,'block_critical':UPDATE_BLOCK_CRITICAL,'block_high':UPDATE_BLOCK_HIGH,'containers':rows}
 
 
@@ -3104,7 +3326,7 @@ Last successful scan: ${sc.critical||0} critical · ${sc.high||0} high · ${sc.m
 Important: rebuilding the exact same source/base image can reproduce the same vulnerabilities.`;await kmDialog({title:`Local Build · ${n}`,text,ok:'Understood'})}catch(e){toast(e.message,'error')}}
 async function checkUpdate(n){try{toast('Capturing rollback snapshot and checking image…','warn');let p=await api(`/api/updates/${encodeURIComponent(n)}/check`,{method:'POST'});if(p.status==='local-build'){await showLocalBuildHelp(n);return}if(p.status==='current'){toast(`${n} is current. Rollback snapshot saved.`,'ok');return}let v=await api(`/api/updates/${p.plan_id}/verify`,{method:'POST'});if(!v.ok){toast(`Update blocked by verification for ${n}`,'error');return}let ok=await kmDialog({title:`Apply verified update to ${n}?`,text:`Rollback snapshot #${p.rollback_snapshot.snapshot_id} is ready. If post-update health fails, Kingdom will automatically restore image ${String(p.old_image_id).slice(0,28)}…`,ok:'Apply Update',danger:true});if(!ok)return;let r=await api(`/api/updates/${p.plan_id}/apply`,{method:'POST'});toast(r.ok?'Update completed; rollback remains available.':'Update failed','ok');load()}catch(e){toast(e.message,'error')}}
 async function rollbackUpdate(id,n){if(!(await kmDialog({title:`Rollback ${n}?`,text:'Kingdom will recreate the container from its saved pre-update Docker configuration and immutable previous image ID.',ok:'Rollback',danger:true})))return;try{let r=await api(`/api/updates/${id}/rollback`,{method:'POST'});toast(`Rollback completed for ${n}`,'ok');openUpdates();load()}catch(e){toast(e.message,'error')}}
-async function openUpdates(){try{let rows=await api('/api/updates');document.getElementById('drawerTitle').textContent='Update & Rollback Center';document.getElementById('drawerSubtitle').textContent='Per-container Auto-Update · Trivy gate · immutable rollback · automatic health rollback';document.getElementById('drawerBody').innerHTML=`<section><h3>SAFE UPDATE MODEL</h3><p class="muted">Auto-Update is opt-in per container. Kingdom captures the exact running image/configuration, verifies the candidate with Trivy, refuses unsafe stateful updates, observes health after replacement, and automatically rolls back a failed update. Rings 3–4 remain manual.</p></section><section><h3>RECENT UPDATE PLANS</h3>${rows.map(x=>`<div class="event"><div><strong>${esc(x.container_name)}</strong><span class="tiny">#${x.id} · ${esc(x.status)} · ${new Date(x.created_ts*1000).toLocaleString()}<br>${esc(String(x.old_image_id||'').slice(0,22))} → ${esc(String(x.candidate_image_id||'').slice(0,22))}</span></div><div class="toolbar">${['completed','failed','rolled-back'].includes(x.status)?`<button class="btn-secondary btn-compact" onclick="rollbackUpdate(${x.id},'${esc(x.container_name)}')">↶ Rollback</button>`:''}</div></div>`).join('')||'<div class="tiny">No update checks yet.</div>'}</section>`;document.getElementById('drawer').classList.remove('hidden')}catch(e){toast(e.message,'error')}}
+async function openUpdates(){try{let rows=await api('/api/updates');document.getElementById('drawerTitle').textContent='Update & Rollback Center';document.getElementById('drawerSubtitle').textContent='Per-container Auto-Update · Portainer/Compose source of truth · Trivy gate · automatic rollback';document.getElementById('drawerBody').innerHTML=`<section><h3>SAFE UPDATE MODEL</h3><p class="muted">Auto-Update is opt-in per container. Kingdom captures the exact running image/configuration, verifies the candidate with Trivy, refuses unsafe stateful updates, observes health after replacement, and automatically rolls back a failed update. Rings 3–4 remain manual.</p></section><section><h3>RECENT UPDATE PLANS</h3>${rows.map(x=>`<div class="event"><div><strong>${esc(x.container_name)}</strong><span class="tiny">#${x.id} · ${esc(x.status)} · ${new Date(x.created_ts*1000).toLocaleString()}<br>${esc(String(x.old_image_id||'').slice(0,22))} → ${esc(String(x.candidate_image_id||'').slice(0,22))}</span></div><div class="toolbar">${['completed','failed','rolled-back'].includes(x.status)?`<button class="btn-secondary btn-compact" onclick="rollbackUpdate(${x.id},'${esc(x.container_name)}')">↶ Rollback</button>`:''}</div></div>`).join('')||'<div class="tiny">No update checks yet.</div>'}</section>`;document.getElementById('drawer').classList.remove('hidden')}catch(e){toast(e.message,'error')}}
 async function testDiscord(){try{let r=await api('/api/discord/test',{method:'POST'});toast('Discord test sent · '+r.discord,'ok')}catch(e){toast(e.message,'error')}}
 async function openRecoveryCenter(){try{let rows=await api('/api/disaster-recovery');document.getElementById('drawerTitle').textContent='Disaster Recovery Center';document.getElementById('drawerSubtitle').textContent='Immutable image/config snapshots · dry-run validation · data-backup awareness';document.getElementById('drawerBody').innerHTML=`<section><div class="tiny">Image/config rollback can restore Docker state. Stateful application data requires a separate verified backup.</div></section><section>${rows.slice(0,80).map(x=>`<div class="event"><div><strong>${esc(x.container_name)} · snapshot #${x.id}</strong><span class="tiny">${new Date(x.ts*1000).toLocaleString()} · ${esc(x.reason)}<br>image ${esc(String(x.image_id||'').slice(0,24))} · ${x.image_present?'image ready':'image missing'} · ${x.data_backup_verified?'data backup verified':'data backup unverified'}${x.compose_source?' · compose '+esc(x.compose_source):''}</span></div><button onclick="testRecovery(${x.id})">Test</button></div>`).join('')||'<div class="tiny">No rollback snapshots yet.</div>'}</section>`;document.getElementById('drawer').classList.remove('hidden')}catch(e){toast(e.message,'error')}}
 async function testRecovery(id){try{let r=await api(`/api/disaster-recovery/${id}/test`,{method:'POST'});toast(r.ok?'Rollback dry-run passed':'Rollback dry-run has warnings',r.ok?'ok':'warn');openRecoveryCenter()}catch(e){toast(e.message,'error')}}
