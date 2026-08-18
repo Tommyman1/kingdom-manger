@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import time
 from datetime import datetime
@@ -16,7 +17,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-VERSION = "3.2.7"
+VERSION = "3.2.8"
 app = FastAPI(title="Kingdom Manager", version=VERSION)
 
 DOCKER = os.getenv("DOCKER_HOST", "tcp://docker-socket-proxy:2375").replace("tcp://", "http://")
@@ -3035,7 +3036,14 @@ async def create_preupdate_backup(container_name: str) -> dict:
              "HostConfig":{"Binds":binds},"Labels":{"kingdom.manager.role":"preupdate-backup","kingdom.manager.container":container_name}}
     helper_id=None
     try:
-        created=await docker_json("POST","/containers/create",payload); helper_id=created.get("Id")
+        try:
+            created=await docker_json("POST","/containers/create",payload)
+        except Exception as e:
+            msg=str(e)
+            if "No such image" in msg or "not found" in msg.lower():
+                raise RuntimeError("backup helper image alpine:3.22 is not present locally; pull alpine:3.22 once on the host, then retry") from e
+            raise
+        helper_id=created.get("Id")
         if not helper_id: raise RuntimeError("backup helper creation returned no container id")
         await docker_json("POST",f"/containers/{helper_id}/start")
         deadline=time.monotonic()+900; exit_code=None
@@ -3053,7 +3061,11 @@ async def create_preupdate_backup(container_name: str) -> dict:
             except Exception: pass
     ap=backup_root/archive
     if not ap.exists() or ap.stat().st_size<1: return {"ok":False,"verified":False,"reason":"archive missing or empty"}
-    sha=hashlib.sha256(ap.read_bytes()).hexdigest()
+    h=hashlib.sha256()
+    with ap.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024*1024), b""):
+            h.update(chunk)
+    sha=h.hexdigest()
     detail={"archive":str(ap),"bytes":ap.stat().st_size,"sha256":sha,"mounts":manifest_mounts}
     Path(str(ap)+".json").write_text(json.dumps({"container_name":container_name,"created_ts":now(),"verified":True,"provider":"kingdom-preupdate",**detail},indent=2))
     with conn() as c:
@@ -3067,8 +3079,13 @@ async def create_preupdate_backup(container_name: str) -> dict:
 
 @app.post("/api/containers/{name}/preupdate-backup")
 async def preupdate_backup(name: str, authorization: str|None=Header(default=None)):
-    require_token(authorization); result=await create_preupdate_backup(name)
-    if not result.get("ok"): raise HTTPException(500,result)
+    require_token(authorization)
+    try:
+        result=await create_preupdate_backup(name)
+    except Exception as e:
+        result={"ok":False,"verified":False,"reason":f"{type(e).__name__}: {e}"}
+    if not result.get("ok"):
+        raise HTTPException(status_code=500, detail=result)
     return result
 
 @app.post("/api/containers/{name}/remediation/plan")
