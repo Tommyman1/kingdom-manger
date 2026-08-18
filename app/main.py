@@ -16,7 +16,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-VERSION = "3.2.6"
+VERSION = "3.2.7"
 app = FastAPI(title="Kingdom Manager", version=VERSION)
 
 DOCKER = os.getenv("DOCKER_HOST", "tcp://docker-socket-proxy:2375").replace("tcp://", "http://")
@@ -109,6 +109,8 @@ DISCORD_NOTIFY_SENSOR_FAILURES = os.getenv("DISCORD_NOTIFY_SENSOR_FAILURES", "tr
 DRIFT_SCAN_ENABLED = os.getenv("KM_DRIFT_SCAN_ENABLED", "true").lower() in {"1","true","yes","on"}
 DRIFT_SCAN_SECONDS = int(os.getenv("KM_DRIFT_SCAN_SECONDS", "1800"))
 BACKUP_MAX_AGE_HOURS = int(os.getenv("KM_BACKUP_MAX_AGE_HOURS", "48"))
+PREUPDATE_BACKUP_ENABLED = os.getenv("KM_PREUPDATE_BACKUP_ENABLED", "true").lower() in {"1","true","yes","on"}
+PREUPDATE_BACKUP_RETENTION = int(os.getenv("KM_PREUPDATE_BACKUP_RETENTION", "5"))
 AUTO_SAFE_PLAYBOOKS = os.getenv("KM_AUTO_SAFE_PLAYBOOKS", "true").lower() in {"1","true","yes","on"}
 SCHEMA_VERSION = 18
 
@@ -3013,6 +3015,62 @@ async def container_vulnerabilities(name: str, authorization: str|None=Header(de
         f['remediation']=(f"Upgrade {f.get('pkg_name')} to {f.get('fixed_version')}" if f['fix_available'] else "No fixed version is listed by Trivy yet; reduce exposure and wait for an upstream image/package fix.")
     return {'container':name,'scan':dict(scan),'findings':findings,'fixable_count':sum(1 for x in findings if x['fix_available']),'unfixed_count':sum(1 for x in findings if not x['fix_available'])}
 
+
+async def create_preupdate_backup(container_name: str) -> dict:
+    if not PREUPDATE_BACKUP_ENABLED:
+        return {"ok":False,"verified":False,"reason":"automatic pre-update backups disabled"}
+    obj=await inspect_container(container_name)
+    mounts=[m for m in (obj.get("Mounts") or []) if m.get("Type") in {"bind","volume"} and m.get("Source")]
+    if not mounts:
+        return {"ok":True,"verified":True,"provider":"none-required","reason":"no persistent mounts"}
+    safe=re.sub(r"[^A-Za-z0-9_.-]+","_",container_name)
+    backup_root=DATA_DIR/"preupdate-backups"/safe; backup_root.mkdir(parents=True,exist_ok=True)
+    stamp=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"); archive=f"{safe}-{stamp}.tar.gz"
+    binds=[]; paths=[]; manifest_mounts=[]
+    for i,m in enumerate(mounts):
+        hp=f"/km-src/{i}"; binds.append(f"{m['Source']}:{hp}:ro"); paths.append(hp)
+        manifest_mounts.append({"type":m.get("Type"),"source":m.get("Source"),"destination":m.get("Destination")})
+    binds.append(f"{backup_root}:/km-backup:rw")
+    payload={"Image":"alpine:3.22","Cmd":["sh","-c","set -eu; tar -czf /km-backup/"+archive+" "+" ".join(paths)+"; test -s /km-backup/"+archive],
+             "HostConfig":{"Binds":binds},"Labels":{"kingdom.manager.role":"preupdate-backup","kingdom.manager.container":container_name}}
+    helper_id=None
+    try:
+        created=await docker_json("POST","/containers/create",payload); helper_id=created.get("Id")
+        if not helper_id: raise RuntimeError("backup helper creation returned no container id")
+        await docker_json("POST",f"/containers/{helper_id}/start")
+        deadline=time.monotonic()+900; exit_code=None
+        while time.monotonic()<deadline:
+            state=await docker_json("GET",f"/containers/{helper_id}/json"); st=state.get("State") or {}
+            if not st.get("Running"): exit_code=st.get("ExitCode"); break
+            await asyncio.sleep(1)
+        if exit_code is None: raise TimeoutError("backup exceeded 15 minutes")
+        if int(exit_code)!=0: raise RuntimeError(f"backup helper exited {exit_code}")
+    except Exception as e:
+        return {"ok":False,"verified":False,"reason":f"{type(e).__name__}: {e}"}
+    finally:
+        if helper_id:
+            try: await docker_json("DELETE",f"/containers/{helper_id}?force=1")
+            except Exception: pass
+    ap=backup_root/archive
+    if not ap.exists() or ap.stat().st_size<1: return {"ok":False,"verified":False,"reason":"archive missing or empty"}
+    sha=hashlib.sha256(ap.read_bytes()).hexdigest()
+    detail={"archive":str(ap),"bytes":ap.stat().st_size,"sha256":sha,"mounts":manifest_mounts}
+    Path(str(ap)+".json").write_text(json.dumps({"container_name":container_name,"created_ts":now(),"verified":True,"provider":"kingdom-preupdate",**detail},indent=2))
+    with conn() as c:
+        c.execute("""INSERT INTO backup_status(container_name,verified_ts,provider,detail) VALUES(?,?,?,?)
+                     ON CONFLICT(container_name) DO UPDATE SET verified_ts=excluded.verified_ts,provider=excluded.provider,detail=excluded.detail""",
+                  (container_name,now(),"kingdom-preupdate",json.dumps(detail))); c.commit()
+    for old in sorted(backup_root.glob("*.tar.gz"),key=lambda p:p.stat().st_mtime,reverse=True)[max(1,PREUPDATE_BACKUP_RETENTION):]:
+        try: Path(str(old)+".json").unlink(missing_ok=True); old.unlink()
+        except Exception: pass
+    return {"ok":True,"verified":True,"provider":"kingdom-preupdate",**detail}
+
+@app.post("/api/containers/{name}/preupdate-backup")
+async def preupdate_backup(name: str, authorization: str|None=Header(default=None)):
+    require_token(authorization); result=await create_preupdate_backup(name)
+    if not result.get("ok"): raise HTTPException(500,result)
+    return result
+
 @app.post("/api/containers/{name}/remediation/plan")
 async def remediation_plan(name: str, authorization: str|None=Header(default=None)):
     require_token(authorization)
@@ -3684,11 +3742,21 @@ async function fixWhatKingdomCan(n){return guarded('remediate:'+n,'Planning fixe
   let c=r.verification?.comparison||{},cur=c.current||{},cand=c.candidate||{},g=r.stateful_gate||{};
   let panel=remediationComparisonHtml(n,c,g);
   if(g.has_mounts&&!g.effective_stateful_update_allowed){
-    await kmDialog({title:`Stateful update safety gate · ${n}`,html:panel+`<div class="remed-callout warn"><b>Stateful permission required</b><div>Enable <b>Allow Stateful Update</b> for this container only after you trust its application-data backup.</div></div>`,ok:'Close',wide:true});return
+    let ok=await kmDialog({title:`Stateful update safety gate · ${n}`,html:panel+`<div class="remed-callout warn"><b>Permission + backup required</b><div>Kingdom can enable Stateful Update for this container and create a verified pre-update archive of its persistent mounted data. The image update remains separately approval-gated.</div></div>`,ok:'Enable + Back Up',cancel:'Cancel',wide:true});
+    if(!ok)return;
+    await api(`/api/policies/${encodeURIComponent(n)}`,{method:'PUT',body:JSON.stringify({allow_stateful_update:true})});
+    toast(`Backing up persistent data for ${n}…`,'ok');
+    let bk=await api(`/api/containers/${encodeURIComponent(n)}/preupdate-backup`,{method:'POST',timeout:900000});
+    if(!bk.verified){toast(`Backup verification failed for ${n}`,'bad');return}
+    toast(`Verified backup created for ${n}`,'ok'); return fixWhatKingdomCan(n);
   }
   if(g.backup_required&&!g.backup_fresh){
-    await kmDialog({title:`Verified backup required · ${n}`,html:panel+`<div class="remed-callout warn"><b>Backup required</b><div>Verify a recent application-data backup in Disaster Recovery, then run remediation again.</div></div>`,ok:'Open Disaster Recovery',wide:true});
-    await openRecoveryCenter();return
+    let ok=await kmDialog({title:`Verified backup required · ${n}`,html:panel+`<div class="remed-callout warn"><b>Create pre-update backup</b><div>Kingdom will archive and verify persistent mounted data before allowing the stateful update.</div></div>`,ok:'Back Up Now',cancel:'Cancel',wide:true});
+    if(!ok)return;
+    toast(`Backing up persistent data for ${n}…`,'ok');
+    let bk=await api(`/api/containers/${encodeURIComponent(n)}/preupdate-backup`,{method:'POST',timeout:900000});
+    if(!bk.verified){toast(`Backup verification failed for ${n}`,'bad');return}
+    toast(`Verified backup created for ${n}`,'ok'); return fixWhatKingdomCan(n);
   }
   if(r.can_apply_now){
     let ok=await kmDialog({title:`Fix what Kingdom can · ${n}`,html:panel+`<div class="remed-callout good"><b>Safe remediation ready</b><div>The candidate passes normal security gates. Kingdom will preserve rollback, redeploy through Portainer when available, and verify health before declaring success.</div></div>`,ok:'Apply Safe Fixes',danger:true,wide:true});
