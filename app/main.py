@@ -17,7 +17,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-VERSION = "3.2.13"
+VERSION = "3.2.14"
 app = FastAPI(title="Kingdom Manager", version=VERSION)
 
 DOCKER = os.getenv("DOCKER_HOST", "tcp://docker-socket-proxy:2375").replace("tcp://", "http://")
@@ -1383,7 +1383,13 @@ async def falco_webhook(request: Request, token: str = ""):
         "container_name": name,
     })
     invalidate_security_snapshot()
-    return asyncio.create_task(_falco_background_decision("falco", severity, name, msg))
+    asyncio.create_task(_falco_background_decision("falco", severity, name, msg))
+    return {
+        "ok": True,
+        "accepted": True,
+        "sensor": "falco",
+        "received_ts": received_ts,
+    }
 
 
 @app.post("/api/containers/{name}/isolate")
